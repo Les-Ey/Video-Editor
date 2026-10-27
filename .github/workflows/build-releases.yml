@@ -1,0 +1,66 @@
+name: Build Windows, macOS & Linux Releases
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-multi-os:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            script: dist:win
+          - os: macos-latest
+            script: dist:mac
+          - os: ubuntu-latest
+            script: dist:linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies (downloads native OS FFmpeg & FFprobe)
+        working-directory: SpliceWright
+        run: npm install
+
+      - name: Build & Package Application (${{ matrix.os }})
+        working-directory: SpliceWright
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run ${{ matrix.script }}
+
+      - name: Upload Installer Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpliceWright-${{ matrix.os }}
+          path: |
+            SpliceWright/release/*.exe
+            SpliceWright/release/*.dmg
+            SpliceWright/release/*.zip
+            SpliceWright/release/*.AppImage
+            SpliceWright/release/*.deb
+
+      - name: Attach Installers to GitHub Release (on v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            SpliceWright/release/*.exe
+            SpliceWright/release/*.dmg
+            SpliceWright/release/*.zip
+            SpliceWright/release/*.AppImage
+            SpliceWright/release/*.deb

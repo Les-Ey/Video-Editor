@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="amberGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fbbf24" />
+      <stop offset="100%" stop-color="#d97706" />
+    </linearGradient>
+    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#2563eb" />
+    </linearGradient>
+    <linearGradient id="emeraldGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#34d399" />
+      <stop offset="100%" stop-color="#059669" />
+    </linearGradient>
+    <linearGradient id="purpleGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#c084fc" />
+      <stop offset="100%" stop-color="#7e22ce" />
+    </linearGradient>
+  </defs>
+
+  <!-- App Icon Rounded Square Background -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#0f1626" stroke="#f59e0b" stroke-width="8" />
+
+  <!-- Clapperboard Top Bar -->
+  <g transform="translate(38, 42) rotate(-8, 90, 20)">
+    <rect x="0" y="0" width="180" height="38" rx="8" fill="url(#amberGrad)" />
+    <polygon points="26,0 52,0 36,38 10,38" fill="#0f1626" />
+    <polygon points="80,0 106,0 90,38 64,38" fill="#0f1626" />
+    <polygon points="134,0 160,0 144,38 118,38" fill="#0f1626" />
+  </g>
+
+  <!-- Clapperboard Body -->
+  <rect x="38" y="92" width="180" height="122" rx="14" fill="#0b101d" stroke="#f59e0b" stroke-width="6" />
+
+  <!-- Timeline Tracks Inside Clapperboard -->
+  <rect x="56" y="114" width="92" height="18" rx="5" fill="url(#cyanGrad)" />
+  <rect x="156" y="114" width="44" height="18" rx="5" fill="#1d4ed8" />
+
+  <rect x="56" y="144" width="66" height="18" rx="5" fill="url(#emeraldGrad)" />
+  <rect x="130" y="144" width="70" height="18" rx="5" fill="url(#emeraldGrad)" />
+
+  <rect x="56" y="174" width="144" height="18" rx="5" fill="url(#purpleGrad)" />
+
+  <!-- Playhead -->
+  <line x1="126" y1="84" x2="126" y2="222" stroke="#ef4444" stroke-width="6" />
+  <polygon points="114,80 138,80 126,95" fill="#ef4444" />
+</svg>

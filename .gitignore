@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+SpliceWright/node_modules/
+
+# Build & Packaged Outputs
+SpliceWright/dist/
+SpliceWright/dist-electron/
+SpliceWright/release/
+dist/
+dist-electron/
+release/
+
+# Generated Sample Project & Temporary Render Caches
+sample-ai-movie/
+**/exports/.temp/
+**/exports/.cache/
+**/exports/.stitch-temp/
+**/assets/audio/normalized/
+**/archive/
+**/_archive/
+**/.archive/
+
+# Internal Development Notes in docs/ (Keep Only User Manual & Logo in Public Repo)
+docs/*
+!docs/USER-MANUAL.md
+!docs/image/
+docs/image/*
+!docs/image/how-I-made-SpliceWright/
+docs/image/how-I-made-SpliceWright/*
+!docs/image/how-I-made-SpliceWright/splicewright-logo.png
+!docs/image/how-I-made-SpliceWright/splicewright-logo.svg
+
+# Logs & OS Metadata
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
