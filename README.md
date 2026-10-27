@@ -3,7 +3,8 @@
 ![SpliceWright Logo](./docs/image/how-I-made-SpliceWright/splicewright-logo.png)
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg?style=for-the-badge)](./LICENSE)
-[![Platform: Windows | macOS | Linux](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6?style=for-the-badge)](./SpliceWright)
+[![Platform: Windows | macOS | Linux](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6?style=for-the-badge)](https://github.com/Les-Ey/Video-Editor/releases/latest)
+[![Download Latest Release](https://img.shields.io/badge/%E2%AC%87%EF%B8%8F%20Download%20Installers-Releases-10b981?style=for-the-badge)](https://github.com/Les-Ey/Video-Editor/releases/latest)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/les.ey)
 
 **SpliceWright** is a local-first, zero-SaaS desktop video editor built with **Electron, React, TypeScript, and FFmpeg**. It is designed both as the companion finishing & assembly bay for the **SpliceWright Studio** VS Code extension (`ai-movie.json`) and as a standalone, portable folder-based multi-track video editor that runs cleanly off internal drives or external SSDs.
