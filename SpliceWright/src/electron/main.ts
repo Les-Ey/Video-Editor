@@ -4,6 +4,7 @@ import path from 'path';
 import chokidar, { FSWatcher } from 'chokidar';
 import {
   ExportOptions,
+  ImportMediaSceneTarget,
   MediaAssetKind,
   ProjectMediaAsset,
   StitchCatalogue,
@@ -11,9 +12,15 @@ import {
   StitchVideoItem,
   VideoProjectManifest,
 } from '../shared/types';
-import { detectHardwareProfile, probeMediaDuration } from './hardware';
+import {
+  detectHardwareProfile,
+  probeMediaChapters,
+  probeMediaDuration,
+  remuxMkvToMp4,
+} from './hardware';
 import {
   computeAiMovieSyncSummary,
+  convertStandaloneToStudioProject,
   createOrLoadStandaloneProject,
   getVideoProjectPath,
   loadProjectFromFolder,
@@ -21,6 +28,7 @@ import {
   normalizeRelPath,
   readAiMovieReadOnly,
   rebuildProjectFromAiMovie,
+  refreshSingleClipInProject,
   saveStitchCatalogueToDisk,
   saveVideoProjectManifest,
   scanOrLoadStitchCatalogue,
@@ -360,6 +368,19 @@ app.whenReady().then(() => {
   );
 
   ipcMain.handle(
+    'project:convert-to-studio',
+    async (_event, projectRoot: string, currentProject: VideoProjectManifest) => {
+      lastInternalSaveTimestamp = Date.now();
+      const bundle = await convertStandaloneToStudioProject(projectRoot, currentProject);
+      activeProjectRoot = projectRoot;
+      latestLoadedProject = bundle.project;
+      setupAiMovieWatcher(projectRoot);
+      setupProjectManifestWatcher(projectRoot);
+      return bundle;
+    }
+  );
+
+  ipcMain.handle(
     'project:save',
     async (_event, projectRoot: string, project: VideoProjectManifest) => {
       latestLoadedProject = project;
@@ -371,7 +392,12 @@ app.whenReady().then(() => {
 
   ipcMain.handle(
     'project:import-media',
-    async (_event, projectRoot: string, targetKind: MediaAssetKind) => {
+    async (
+      _event,
+      projectRoot: string,
+      targetKind: MediaAssetKind,
+      sceneTarget?: ImportMediaSceneTarget
+    ) => {
       if (!mainWindow) return [];
 
       const filters =
@@ -389,6 +415,13 @@ app.whenReady().then(() => {
               },
             ];
 
+      const assignedSceneId =
+        sceneTarget &&
+        (sceneTarget.mode === 'assigned-scene' || sceneTarget.mode === 'new-scene') &&
+        sceneTarget.sceneId
+          ? sceneTarget.sceneId
+          : undefined;
+
       const preferredDefaultDir =
         targetKind === 'dialogue'
           ? fs.existsSync(path.join(projectRoot, 'audio'))
@@ -403,7 +436,9 @@ app.whenReady().then(() => {
           : projectRoot;
 
       const res = await dialog.showOpenDialog(mainWindow, {
-        title: `Import ${targetKind.toUpperCase()} Files (From Project Folder or External Drive)`,
+        title: `Import ${targetKind.toUpperCase()} Files${
+          assignedSceneId ? ` for ${assignedSceneId}` : ''
+        } (From Project Folder or External Drive)`,
         defaultPath: preferredDefaultDir,
         properties: ['openFile', 'multiSelections'],
         filters,
@@ -411,34 +446,52 @@ app.whenReady().then(() => {
 
       if (res.canceled || res.filePaths.length === 0) return [];
 
-      const subFolder =
-        targetKind === 'video' || targetKind === 'image'
-          ? path.join('assets', 'video')
-          : path.join('assets', 'audio');
-
-      const destDir = path.join(projectRoot, subFolder);
-      fs.mkdirSync(destDir, { recursive: true });
-
       const importedAssets: ProjectMediaAsset[] = [];
       const normalizedRoot = path.resolve(projectRoot).toLowerCase();
 
       for (const srcFile of res.filePaths) {
         const ext = path.extname(srcFile);
+        const lowerExt = ext.toLowerCase();
         const baseName = path.basename(srcFile, ext);
         const resolvedSrc = path.resolve(srcFile);
+        const isImgSource = ['.png', '.jpg', '.jpeg', '.webp'].includes(lowerExt);
+
+        // Determine target subfolder based on scene assignment & media kind
+        const subFolder = assignedSceneId
+          ? targetKind === 'video' || targetKind === 'image'
+            ? isImgSource
+              ? path.join('scenes', assignedSceneId)
+              : path.join('scenes', assignedSceneId, 'videos')
+            : path.join('audio', assignedSceneId)
+          : targetKind === 'video' || targetKind === 'image'
+          ? isImgSource
+            ? path.join('assets', 'images')
+            : path.join('assets', 'video')
+          : path.join('assets', 'audio');
+
+        const destDir = path.join(projectRoot, subFolder);
+        fs.mkdirSync(destDir, { recursive: true });
 
         let destFull = resolvedSrc;
         let relPath = '';
 
-        // If the selected file is already inside the project folder (e.g., `audio/scene-1/...` or `assets/images/...`),
-        // reference it in-place without duplicating it into `assets/audio/`!
-        if (resolvedSrc.toLowerCase().startsWith(normalizedRoot + path.sep)) {
+        // Scenario 1 (Section 8): If importing an OBS `.mkv` recording, losslessly remux via `ffmpeg -y -i input.mkv -map 0 -c copy`
+        if (lowerExt === '.mkv') {
+          let safeMp4Name = `${baseName}.mp4`;
+          destFull = path.join(destDir, safeMp4Name);
+          if (fs.existsSync(destFull)) {
+            safeMp4Name = `${baseName}_${Date.now().toString().slice(-5)}.mp4`;
+            destFull = path.join(destDir, safeMp4Name);
+          }
+          await remuxMkvToMp4(resolvedSrc, destFull);
+          relPath = normalizeRelPath(path.join(subFolder, safeMp4Name));
+        } else if (resolvedSrc.toLowerCase().startsWith(normalizedRoot + path.sep)) {
+          // If the selected file is already inside the project folder, reference it in-place without duplicating it!
           relPath = normalizeRelPath(path.relative(projectRoot, resolvedSrc));
         } else {
           let safeFileName = `${baseName}${ext}`;
           destFull = path.join(destDir, safeFileName);
 
-          // Collision-safe filename if a different file with the same name already exists
           if (fs.existsSync(destFull) && resolvedSrc !== path.resolve(destFull)) {
             safeFileName = `${baseName}_${Date.now().toString().slice(-5)}${ext}`;
             destFull = path.join(destDir, safeFileName);
@@ -450,21 +503,52 @@ app.whenReady().then(() => {
           relPath = normalizeRelPath(path.join(subFolder, safeFileName));
         }
 
-        const isImg = ['.png', '.jpg', '.jpeg', '.webp'].includes(ext.toLowerCase());
+        const finalExt = path.extname(destFull).toLowerCase();
+        const isImg = ['.png', '.jpg', '.jpeg', '.webp'].includes(finalExt);
+        const isVid = ['.mp4', '.webm', '.mov', '.mkv'].includes(finalExt);
         const duration = isImg ? 6.0 : await probeMediaDuration(destFull);
         const actualKind: MediaAssetKind = isImg
           ? 'image'
-          : ['.mp4', '.webm', '.mov', '.mkv'].includes(ext.toLowerCase())
+          : isVid
           ? 'video'
           : targetKind;
+
+        let probedChapters = isVid ? await probeMediaChapters(destFull) : [];
+        if (probedChapters.length > 0 && mainWindow) {
+          const choice = await dialog.showMessageBox(mainWindow, {
+            type: 'question',
+            buttons: [
+              `Place ${probedChapters.length} Chapter Sub-Clips on Timeline`,
+              'Import as Single Master Video Only',
+            ],
+            defaultId: 0,
+            cancelId: 1,
+            title: 'OBS / Video Chapter Markers Detected',
+            message: `Found ${probedChapters.length} embedded chapter marker(s) in "${path.basename(
+              destFull
+            )}".`,
+            detail:
+              'Would you like SpliceWright to automatically split and place non-destructive sub-clips for each chapter onto the timeline?',
+          });
+          if (choice.response !== 0) {
+            probedChapters = [];
+          }
+        }
+
+        const prefixLabel = assignedSceneId
+          ? `[${sceneTarget?.sceneTitle || assignedSceneId}]`
+          : `[${actualKind.toUpperCase()}]`;
 
         importedAssets.push({
           id: `asset_imp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           kind: actualKind,
-          label: `[${actualKind.toUpperCase()}] ${path.basename(destFull)}`,
+          label: `${prefixLabel} ${path.basename(destFull)}`,
           relativePath: relPath,
           durationSeconds: Math.round(duration * 100) / 100,
+          sceneId: assignedSceneId,
           source: 'user-imported',
+          cacheVersion: Date.now(),
+          probedChapters: probedChapters.length > 0 ? probedChapters : undefined,
         });
       }
 
@@ -505,6 +589,20 @@ app.whenReady().then(() => {
         },
         syncSummary,
       };
+    }
+  );
+
+  ipcMain.handle(
+    'project:refresh-single-clip',
+    async (_event, projectRoot: string, currentProject: VideoProjectManifest, clipId: string) => {
+      lastInternalSaveTimestamp = Date.now();
+      const res = await refreshSingleClipInProject(projectRoot, currentProject, clipId);
+      latestLoadedProject = res.project;
+      if (mainWindow && fs.existsSync(path.join(projectRoot, 'ai-movie.json'))) {
+        const summary = await computeAiMovieSyncSummary(projectRoot, res.project);
+        mainWindow.webContents.send('ai-movie:updated', summary);
+      }
+      return res;
     }
   );
 

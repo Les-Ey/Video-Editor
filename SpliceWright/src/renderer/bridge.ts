@@ -6,11 +6,16 @@ declare global {
   }
 }
 
-export function buildMediaUrl(projectRoot: string, relativePath: string): string {
+export function buildMediaUrl(
+  projectRoot: string,
+  relativePath: string,
+  cacheVersion?: number | string
+): string {
   const cleanRel = relativePath.replace(/\\/g, '/').replace(/^\.\//, '');
   const cleanRoot = projectRoot.replace(/\\/g, '/').replace(/\/$/, '');
   const fullPath = `${cleanRoot}/${cleanRel}`;
-  return `media://local?path=${encodeURIComponent(fullPath)}`;
+  const suffix = cacheVersion ? `&v=${encodeURIComponent(String(cacheVersion))}` : '';
+  return `media://local?path=${encodeURIComponent(fullPath)}${suffix}`;
 }
 
 export function formatTimecode(seconds: number): string {

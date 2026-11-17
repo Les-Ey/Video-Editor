@@ -1,5 +1,6 @@
 import React, { useMemo, useRef, useState } from 'react';
 import {
+  getClipTimelineDuration,
   ProjectMediaAsset,
   TimelineClip,
   TimelineMarker,
@@ -8,6 +9,7 @@ import {
   VideoProjectManifest,
 } from '../../shared/types';
 import { formatTimecode } from '../bridge';
+import { addTextClip } from '../../shared/textOverlay';
 import {
   Scissors,
   Trash2,
@@ -24,6 +26,7 @@ import {
   ChevronDown,
   ChevronUp,
   X,
+  Type,
 } from 'lucide-react';
 
 interface TimelineEditorProps {
@@ -45,6 +48,7 @@ interface TimelineEditorProps {
   onCommitUndoSnapshot?: (snapshot: VideoProjectManifest) => void;
   onNormalizeDialogue?: (includeSfxAndMusic?: boolean) => void;
   onPreMixAudio?: () => void;
+  onPausePlayback?: () => void;
 }
 
 /**
@@ -58,8 +62,8 @@ function packClipsIntoSubLanes(clips: TimelineClip[]): {
     if (Math.abs(a.timelineStart - b.timelineStart) > 0.001) {
       return a.timelineStart - b.timelineStart;
     }
-    const durA = a.sourceOut - a.sourceIn;
-    const durB = b.sourceOut - b.sourceIn;
+    const durA = getClipTimelineDuration(a);
+    const durB = getClipTimelineDuration(b);
     return durB - durA;
   });
 
@@ -67,7 +71,7 @@ function packClipsIntoSubLanes(clips: TimelineClip[]): {
   const laneByClipId = new Map<string, number>();
 
   for (const clip of sorted) {
-    const dur = Math.max(0.15, clip.sourceOut - clip.sourceIn);
+    const dur = Math.max(0.15, getClipTimelineDuration(clip));
     const start = clip.timelineStart;
     const end = start + dur;
 
@@ -119,8 +123,9 @@ export function deleteClipFromManifest(
   }
 
   if (!deletedClip) return prev;
+  if (deletedTrackType === 'text') return next;
 
-  const clipDur = Math.max(0.1, deletedClip.sourceOut - deletedClip.sourceIn);
+  const clipDur = getClipTimelineDuration(deletedClip);
   const clipStart = deletedClip.timelineStart;
   const dismissedSet = new Set<string>(next.dismissedSceneIds || []);
 
@@ -215,6 +220,7 @@ const TRACK_COLORS: Record<TrackType, { bg: string; border: string; badge: strin
   dialogue: { bg: '#064e3b', border: '#10b981', badge: '#34d399' },
   sfx: { bg: '#581c87', border: '#a855f7', badge: '#c084fc' },
   music: { bg: '#78350f', border: '#f59e0b', badge: '#fbbf24' },
+  text: { bg: '#4a1d66', border: '#d946ef', badge: '#f0abfc' },
 };
 
 const TRACK_HEADER_WIDTH = 220;
@@ -235,6 +241,7 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
   onCommitUndoSnapshot,
   onNormalizeDialogue,
   onPreMixAudio,
+  onPausePlayback,
 }) => {
   const [pixelsPerSecond, setPixelsPerSecond] = useState<number>(52);
   const [rippleMode, setRippleMode] = useState<boolean>(true);
@@ -251,7 +258,7 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
     let max = 16;
     for (const track of project.timeline.tracks) {
       for (const clip of track.clips) {
-        const end = clip.timelineStart + Math.max(0.1, clip.sourceOut - clip.sourceIn);
+        const end = clip.timelineStart + getClipTimelineDuration(clip);
         if (end + 4 > max) max = end + 4;
       }
     }
@@ -284,7 +291,14 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
     );
   };
 
-  // Split selected clip at playhead
+  const handleAddText = () => {
+    onPausePlayback?.();
+    const id = `text_${crypto.randomUUID()}`;
+    onUpdateProject((prev) => addTextClip(prev, playhead, id));
+    onSelectClip(id);
+  };
+
+  // Split selected clip at playhead (Scenario 1 Section 8: preserves sceneId and accounts for playbackRate)
   const handleSplitAtPlayhead = () => {
     if (!selectedClipId) return;
     onUpdateProject((prev) => {
@@ -293,12 +307,13 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
         const idx = track.clips.findIndex((c) => c.id === selectedClipId);
         if (idx === -1) continue;
         const clip = track.clips[idx];
-        const dur = clip.sourceOut - clip.sourceIn;
-        const offset = playhead - clip.timelineStart;
-        if (offset <= 0.15 || offset >= dur - 0.15) {
+        const rate = clip.playbackRate && clip.playbackRate > 0 ? clip.playbackRate : 1.0;
+        const timelineDur = getClipTimelineDuration(clip);
+        const offsetTimeline = playhead - clip.timelineStart;
+        if (offsetTimeline <= 0.15 || offsetTimeline >= timelineDur - 0.15) {
           return prev; // Playhead not inside selected clip
         }
-        const splitPointSource = Math.round((clip.sourceIn + offset) * 100) / 100;
+        const splitPointSource = Math.round((clip.sourceIn + offsetTimeline * rate) * 100) / 100;
         const secondClip: TimelineClip = {
           ...clip,
           id: `${clip.id}_part2_${Date.now().toString().slice(-4)}`,
@@ -375,6 +390,7 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
         if (clip) {
           clip.assetId = newAsset.id;
           clip.label = newAsset.label;
+          delete clip.missingMedia;
           clip.sourceIn = 0;
           clip.sourceOut = newAsset.durationSeconds;
           if (newAsset.kind === 'image' || newAsset.isPosterFallback) {
@@ -410,6 +426,7 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
     const origSourceOut = clip.sourceOut;
     const asset = assetMap.get(clip.assetId);
     const maxAssetDur =
+      clip.textOverlay ? Number.POSITIVE_INFINITY :
       asset?.kind === 'image' || asset?.isPosterFallback ? 300 : asset?.durationSeconds || 60;
 
     // Snapshot initial positions of all clips and markers so dragging/rippling is non-cumulative
@@ -447,18 +464,23 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
               appliedShift = newStart - origTimelineStart;
               target.timelineStart = newStart;
             } else if (mode === 'trim-left') {
-              const maxIn = origSourceOut - 0.25;
-              const newIn = Math.max(0, Math.min(maxIn, origSourceIn + deltaSec));
-              const appliedDelta = newIn - origSourceIn;
+              const rate = target.playbackRate && target.playbackRate > 0 ? target.playbackRate : 1.0;
+              const maxIn = origSourceOut - 0.25 * rate;
+              const newIn = Math.max(0, Math.min(maxIn, origSourceIn + deltaSec * rate));
+              const appliedSourceDelta = newIn - origSourceIn;
               target.sourceIn = Math.round(newIn * 20) / 20;
-              const newStart = Math.max(0, Math.round((origTimelineStart + appliedDelta) * 20) / 20);
+              const newStart = Math.max(
+                0,
+                Math.round((origTimelineStart + appliedSourceDelta / rate) * 20) / 20
+              );
               appliedShift = newStart - origTimelineStart;
               target.timelineStart = newStart;
             } else if (mode === 'trim-right') {
-              const minOut = origSourceIn + 0.25;
-              const newOut = Math.max(minOut, Math.min(maxAssetDur, origSourceOut + deltaSec));
+              const rate = target.playbackRate && target.playbackRate > 0 ? target.playbackRate : 1.0;
+              const minOut = origSourceIn + 0.25 * rate;
+              const newOut = Math.max(minOut, Math.min(maxAssetDur, origSourceOut + deltaSec * rate));
               const roundedOut = Math.round(newOut * 20) / 20;
-              appliedShift = roundedOut - origSourceOut;
+              appliedShift = (roundedOut - origSourceOut) / rate;
               target.sourceOut = roundedOut;
             }
             break;
@@ -613,6 +635,10 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+          <button onClick={handleAddText} style={toolBtnStyle} title="Add a text overlay at the playhead">
+            <Type size={14} color="#f0abfc" />
+            <span>Add Text</span>
+          </button>
           <button
             onClick={onUndo}
             disabled={!canUndo}
@@ -1092,7 +1118,9 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
 
                       <button
                         onClick={() => handleToggleMute(track.id)}
-                        title={track.muted ? 'Unmute Track' : 'Mute Track'}
+                        title={track.type === 'text'
+                          ? (track.muted ? 'Show Text Track' : 'Hide Text Track')
+                          : (track.muted ? 'Unmute Track' : 'Mute Track')}
                         style={{
                           background: 'transparent',
                           border: 'none',
@@ -1105,7 +1133,7 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
                     </div>
                   </div>
 
-                  {track.type !== 'video' && (
+                  {track.type !== 'video' && track.type !== 'text' && (
                     <div
                       style={{
                         display: 'flex',
@@ -1154,7 +1182,7 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
                   >
                     {/* Clips */}
                     {track.clips.map((clip) => {
-                      const dur = Math.max(0.15, clip.sourceOut - clip.sourceIn);
+                      const dur = Math.max(0.15, getClipTimelineDuration(clip));
                       const leftPx = clip.timelineStart * pixelsPerSecond;
                       const widthPx = Math.max(18, dur * pixelsPerSecond);
                       const isSelected = clip.id === selectedClipId;
@@ -1179,6 +1207,7 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
                       return (
                         <div
                           key={clip.id}
+                          data-clip-id={clip.id}
                           onMouseDown={(ev) => startClipInteraction(ev, clip, 'move')}
                           onClick={(ev) => {
                             ev.stopPropagation();
@@ -1237,8 +1266,15 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
                             textOverflow: 'ellipsis',
                           }}
                         >
-                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                            {clip.label}
+                          <span
+                            style={{
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              color: clip.missingMedia ? '#fca5a5' : undefined,
+                            }}
+                            title={clip.missingMedia ? 'Missing media: file not found or archived' : undefined}
+                          >
+                            {clip.missingMedia ? `⚠ Missing media — ${clip.label}` : clip.label}
                           </span>
 
                           {hasMultipleTakes && (
@@ -1348,6 +1384,34 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
                               >
                                 <Camera size={10} />
                                 {clip.kenBurns}
+                              </span>
+                            )}
+                            {clip.fitMode && clip.fitMode !== 'contain' && (
+                              <span
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '2px',
+                                  color: '#c084fc',
+                                  fontWeight: 600,
+                                }}
+                                title={`Fit / Stretch Mode: ${clip.fitMode}`}
+                              >
+                                ⤢ {clip.fitMode}
+                              </span>
+                            )}
+                            {clip.playbackRate && Math.abs(clip.playbackRate - 1.0) > 0.01 && (
+                              <span
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '2px',
+                                  color: '#fbbf24',
+                                  fontWeight: 700,
+                                }}
+                                title={`Playback Speed Multiplier: ${clip.playbackRate}x`}
+                              >
+                                ⚡ {clip.playbackRate}x
                               </span>
                             )}
                             {hasMultipleTakes && (

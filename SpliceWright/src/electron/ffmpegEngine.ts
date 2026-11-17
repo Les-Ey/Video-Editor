@@ -2,8 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 import {
+  ClipFitMode,
   ExportOptions,
   ExportProgressEvent,
+  getClipTimelineDuration,
   KenBurnsPreset,
   ProjectMediaAsset,
   StitchChaptersOptions,
@@ -11,7 +13,28 @@ import {
   VideoProjectManifest,
   VisualLookPreset,
 } from '../shared/types';
-import { getFfmpegPath } from './hardware';
+import { getFfmpegPath, hasAudioStream } from './hardware';
+import { createMottledBackgroundBmp, getStillCamera } from '../shared/imageBackground';
+import { getTextClips, getTextPosition } from '../shared/textOverlay';
+
+function buildAtempoFilterChain(rate: number): string {
+  const safeRate = Math.max(0.25, Math.min(8.0, rate || 1.0));
+  if (Math.abs(safeRate - 1.0) <= 0.01) return '';
+  const filters: string[] = [];
+  let remaining = safeRate;
+  while (remaining > 2.0 + 0.001) {
+    filters.push('atempo=2.0');
+    remaining /= 2.0;
+  }
+  while (remaining < 0.5 - 0.001) {
+    filters.push('atempo=0.5');
+    remaining /= 0.5;
+  }
+  if (Math.abs(remaining - 1.0) > 0.01) {
+    filters.push(`atempo=${remaining.toFixed(4)}`);
+  }
+  return filters.join(',');
+}
 
 function buildVisualLookVideoFilter(preset: VisualLookPreset | undefined): string {
   switch (preset) {
@@ -30,16 +53,111 @@ function buildVisualLookVideoFilter(preset: VisualLookPreset | undefined): strin
   }
 }
 
-function buildImageKenBurnsFilter(
-  preset: KenBurnsPreset | undefined,
+function buildBaseFramingFilter(
+  fitMode: ClipFitMode | undefined,
+  width: number,
+  height: number,
+  durationSec: number,
+  preset: KenBurnsPreset | undefined
+): string {
+  const dur = Math.max(0.1, durationSec);
+  const effectiveFit: ClipFitMode =
+    fitMode || (preset === 'star-wars-crawl' ? 'fill-width' : 'contain');
+
+  switch (effectiveFit) {
+    case 'stretch-fill':
+      return `scale=${width}:${height},setsar=1`;
+    case 'cover-crop':
+      return `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1`;
+    case 'fill-width': {
+      const yExpr =
+        preset === 'pan-top-to-bottom' || preset === 'zoom-in-bottom'
+          ? `(in_h-out_h)*min(1\\,max(0\\,t/${dur}))`
+          : preset === 'pan-bottom-to-top'
+          ? `(in_h-out_h)*(1-min(1\\,max(0\\,t/${dur})))`
+          : '0';
+      return `scale=${width}:-2,pad=${width}:max(ih\\,${height}):(ow-iw)/2:(oh-ih)/2:color=black,crop=${width}:${height}:0:${yExpr},setsar=1`;
+    }
+    case 'fill-height': {
+      const xExpr =
+        preset === 'pan-left-to-right'
+          ? `(in_w-out_w)*min(1\\,max(0\\,t/${dur}))`
+          : preset === 'pan-right-to-left'
+          ? `(in_w-out_w)*(1-min(1\\,max(0\\,t/${dur})))`
+          : '0';
+      return `scale=-2:${height},pad=max(iw\\,${width}):${height}:(ow-iw)/2:(oh-ih)/2:color=black,crop=${width}:${height}:${xExpr}:0,setsar=1`;
+    }
+    case 'contain':
+    default:
+      return `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+  }
+}
+
+function buildStarWarsCrawlFilter(
+  fitMode: ClipFitMode | undefined,
   durationSec: number,
   width: number,
   height: number,
   fps: number,
-  fallbackScalePadFilter: string
-): { useZoomPan: boolean; vf: string } {
-  if (!preset || preset === 'none') {
-    return { useZoomPan: false, vf: fallbackScalePadFilter };
+  lookVf: string
+): string {
+  const dur = Math.max(0.1, durationSec);
+  // Add a 16px pure-black border on the left & right so when `perspective` maps outside the trapezoid,
+  // edge-pixel clamping always samples pure black (`(0,0,0)`) instead of smearing text/UI lines horizontally!
+  const innerW = Math.max(64, width - 32);
+  const scalePart =
+    fitMode === 'stretch-fill'
+      ? `scale=${innerW}:${height},setsar=1`
+      : fitMode === 'contain'
+      ? `scale=${innerW}:${height}:force_original_aspect_ratio=decrease,pad=${innerW}:${height}:(ow-iw)/2:0:color=black,setsar=1`
+      : `scale=${innerW}:-2,setsar=1`;
+  const topPad = Math.round(height * 0.14);
+  const totalExtraPad = Math.round(height * 0.34);
+  const padPart = `pad=${width}:max(ih+${totalExtraPad}\\,${height + totalExtraPad}):(ow-iw)/2:${topPad}:color=black`;
+  const cropPart = `crop=${width}:${height}:0:(in_h-out_h)*min(1\\,max(0\\,t/${dur}))`;
+  // Map top corners to y0=0 and y1=0 (`interpolation=cubic`) so the top row never smears vertically up to the top edge
+  const perspectivePart = `perspective=x0=0.14*W:y0=0:x1=0.86*W:y1=0:x2=0:y2=H:x3=W:y3=H:sense=destination:interpolation=cubic`;
+  return `fps=${fps},${scalePart},${padPart},${cropPart},${perspectivePart}${
+    lookVf ? `,${lookVf}` : ''
+  },format=yuv420p`;
+}
+
+function buildImageKenBurnsFilter(
+  preset: KenBurnsPreset | undefined,
+  fitMode: ClipFitMode | undefined,
+  durationSec: number,
+  width: number,
+  height: number,
+  fps: number,
+  lookVf: string
+): { useLoopInput: boolean; vf: string } {
+  if (preset === 'star-wars-crawl') {
+    return {
+      useLoopInput: true,
+      vf: buildStarWarsCrawlFilter(fitMode, durationSec, width, height, fps, lookVf),
+    };
+  }
+
+  // When fill-width + vertical scroll or fill-height + horizontal pan is used, dynamic crop handles the full document scroll cleanly
+  if (
+    (fitMode === 'fill-width' &&
+      (!preset ||
+        preset === 'none' ||
+        preset === 'pan-top-to-bottom' ||
+        preset === 'pan-bottom-to-top')) ||
+    (fitMode === 'fill-height' &&
+      (!preset ||
+        preset === 'none' ||
+        preset === 'pan-left-to-right' ||
+        preset === 'pan-right-to-left')) ||
+    !preset ||
+    preset === 'none'
+  ) {
+    const baseFraming = buildBaseFramingFilter(fitMode, width, height, durationSec, preset);
+    return {
+      useLoopInput: true,
+      vf: `fps=${fps},${baseFraming}${lookVf ? `,${lookVf}` : ''},format=yuv420p`,
+    };
   }
 
   const totalFrames = Math.max(2, Math.round(durationSec * fps));
@@ -47,64 +165,20 @@ function buildImageKenBurnsFilter(
   // Pre-scale to 2x canvas for sub-pixel smooth zoompan coordinates
   const upW = width * 2;
   const upH = height * 2;
-  const preScale = `scale=${upW}:${upH}:force_original_aspect_ratio=decrease,pad=${upW}:${upH}:(ow-iw)/2:(oh-ih)/2:color=black`;
+  const preScale = buildBaseFramingFilter(fitMode, upW, upH, durationSec, preset);
 
-  let zExpr = `'1+0.18*(on/${denom})'`;
-  let xExpr = `'(iw-iw/zoom)/2'`;
-  let yExpr = `'(ih-ih/zoom)/2'`;
-
-  switch (preset) {
-    case 'zoom-in':
-      zExpr = `'1+0.18*(on/${denom})'`;
-      xExpr = `'(iw-iw/zoom)/2'`;
-      yExpr = `'(ih-ih/zoom)/2'`;
-      break;
-    case 'zoom-out':
-      zExpr = `'1.18-0.18*(on/${denom})'`;
-      xExpr = `'(iw-iw/zoom)/2'`;
-      yExpr = `'(ih-ih/zoom)/2'`;
-      break;
-    case 'pan-top-to-bottom':
-      zExpr = `'1.24'`;
-      xExpr = `'(iw-iw/zoom)/2'`;
-      yExpr = `'(ih-ih/zoom)*(on/${denom})'`;
-      break;
-    case 'pan-bottom-to-top':
-      zExpr = `'1.24'`;
-      xExpr = `'(iw-iw/zoom)/2'`;
-      yExpr = `'(ih-ih/zoom)*(1-(on/${denom}))'`;
-      break;
-    case 'pan-left-to-right':
-      zExpr = `'1.22'`;
-      xExpr = `'(iw-iw/zoom)*(on/${denom})'`;
-      yExpr = `'(ih-ih/zoom)/2'`;
-      break;
-    case 'pan-right-to-left':
-      zExpr = `'1.22'`;
-      xExpr = `'(iw-iw/zoom)*(1-(on/${denom}))'`;
-      yExpr = `'(ih-ih/zoom)/2'`;
-      break;
-    case 'zoom-in-top-left':
-      zExpr = `'1+0.24*(on/${denom})'`;
-      xExpr = `'(iw-iw/zoom)*0.15'`;
-      yExpr = `'(ih-ih/zoom)*0.15'`;
-      break;
-    case 'zoom-in-top-right':
-      zExpr = `'1+0.24*(on/${denom})'`;
-      xExpr = `'(iw-iw/zoom)*0.85'`;
-      yExpr = `'(ih-ih/zoom)*0.15'`;
-      break;
-    case 'zoom-in-bottom':
-      zExpr = `'1+0.24*(on/${denom})'`;
-      xExpr = `'(iw-iw/zoom)/2'`;
-      yExpr = `'(ih-ih/zoom)*0.85'`;
-      break;
-  }
-
+  const startCamera = getStillCamera(preset, 0, fitMode);
+  const endCamera = getStillCamera(preset, 1, fitMode);
+  const interpolate = (from: number, to: number) =>
+    from === to ? String(from) :
+      `${from}${to < from ? '' : '+'}${Number((to - from).toFixed(4))}*(on/${denom})`;
+  const zExpr = `'${interpolate(startCamera.zoom, endCamera.zoom)}'`;
+  const xExpr = `'(iw-iw/zoom)*(${interpolate(startCamera.x, endCamera.x)})'`;
+  const yExpr = `'(ih-ih/zoom)*(${interpolate(startCamera.y, endCamera.y)})'`;
   const zoompan = `zoompan=z=${zExpr}:x=${xExpr}:y=${yExpr}:d=${totalFrames}:s=${width}x${height}:fps=${fps}`;
   return {
-    useZoomPan: true,
-    vf: `${preScale},${zoompan},format=yuv420p`,
+    useLoopInput: false,
+    vf: `${preScale},${zoompan}${lookVf ? `,${lookVf}` : ''},format=yuv420p`,
   };
 }
 
@@ -242,7 +316,7 @@ export async function renderProjectWithFfmpeg(
     for (const track of project.timeline.tracks) {
       if (track.muted) continue;
       for (const clip of track.clips) {
-        const end = clip.timelineStart + Math.max(0.1, clip.sourceOut - clip.sourceIn);
+        const end = clip.timelineStart + getClipTimelineDuration(clip);
         if (end > totalDuration) totalDuration = end;
       }
     }
@@ -268,7 +342,7 @@ export async function renderProjectWithFfmpeg(
     for (const clip of sortedVideoClips) {
       const asset = assetMap.get(clip.assetId);
       const fullPath = asset ? path.join(projectRoot, asset.relativePath) : '';
-      const clipDuration = Math.max(0.1, Math.round((clip.sourceOut - clip.sourceIn) * 100) / 100);
+      const clipDuration = getClipTimelineDuration(clip);
 
       if (clip.timelineStart > cursor + 0.05) {
         segments.push({
@@ -304,9 +378,6 @@ export async function renderProjectWithFfmpeg(
     // Render each video segment to uniform resolution/fps/pixel-format in `exports/.temp/`
     const segmentFiles: string[] = [];
     const lookVf = buildVisualLookVideoFilter(project.lookPreset);
-    const scalePadFilter = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,fps=${fps}${
-      lookVf ? `,${lookVf}` : ''
-    },format=yuv420p`;
 
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
@@ -335,57 +406,97 @@ export async function renderProjectWithFfmpeg(
       } else {
         const assetFullPath = path.join(projectRoot, seg.asset.relativePath);
         if (seg.asset.kind === 'image' || seg.asset.isPosterFallback) {
+          const background = seg.asset.isPlaceholderSlate ? 'black' : seg.clip.imageBackground;
           const kb = buildImageKenBurnsFilter(
             seg.clip.kenBurns,
+            seg.clip.fitMode,
             seg.duration,
             width,
             height,
             fps,
-            scalePadFilter
+            background === 'mottled' || background === 'softened' ? '' : lookVf
           );
-          if (kb.useZoomPan) {
-            const kbWithLook = lookVf
-              ? kb.vf.replace(/,format=yuv420p$/, `,${lookVf},format=yuv420p`)
-              : kb.vf;
-            await runFfmpeg([
-              '-y',
-              '-i',
-              assetFullPath,
-              '-vf',
-              kbWithLook,
-              '-t',
-              String(seg.duration),
-              ...getEncoderArgs(options.encoder, options.preset),
-              '-an',
-              segFile,
-            ]);
+          const args = ['-y'];
+          if (kb.useLoopInput) args.push('-loop', '1');
+          args.push('-i', assetFullPath);
+          if (background === 'mottled' || background === 'softened') {
+            let backgroundFilter: string;
+            let split: string;
+            if (background === 'mottled') {
+              const backdropPath = path.join(tempDir, 'mottled-background.bmp');
+              if (!fs.existsSync(backdropPath)) {
+                fs.writeFileSync(backdropPath, createMottledBackgroundBmp());
+              }
+              args.push('-loop', '1', '-framerate', String(fps), '-i', backdropPath);
+              split = '[0:v]split=2[image][maskSource]';
+              backgroundFilter = `[1:v]scale=${width}:${height},setsar=1[background]`;
+            } else {
+              split = '[0:v]split=3[image][maskSource][backgroundSource]';
+              const bgW = Math.ceil(width * 1.2 / 2) * 2;
+              const bgH = Math.ceil(height * 1.2 / 2) * 2;
+              backgroundFilter =
+                `[backgroundSource]loop=loop=-1:size=1:start=0,setpts=N/(${fps}*TB),fps=${fps},` +
+                `scale=${bgW}:${bgH}:force_original_aspect_ratio=increase,` +
+                `crop=${bgW}:${bgH},gblur=sigma=${width * 0.03},` +
+                `crop=${width}:${height},` +
+                `lutrgb=r=val*0.55:g=val*0.55:b=val*0.55,setsar=1[background]`;
+            }
+            // An identically animated white matte preserves real black image pixels while
+            // removing only framing/perspective padding. The backdrop never enters zoompan.
+            const filter = [
+              split,
+              `[image]${kb.vf}[foreground]`,
+              `[maskSource]lutrgb=r=255:g=255:b=255,${kb.vf},format=gray[mask]`,
+              '[foreground][mask]alphamerge[cutout]',
+              backgroundFilter,
+              `[background][cutout]overlay=shortest=1${lookVf ? `,${lookVf}` : ''},format=yuv420p[out]`,
+            ].join(';');
+            args.push('-filter_complex', filter, '-map', '[out]', '-r', String(fps));
           } else {
-            await runFfmpeg([
-              '-y',
-              '-loop',
-              '1',
-              '-i',
-              assetFullPath,
-              '-t',
-              String(seg.duration),
-              '-vf',
-              scalePadFilter,
-              ...getEncoderArgs(options.encoder, options.preset),
-              '-an',
-              segFile,
-            ]);
+            args.push('-vf', kb.vf);
           }
+          args.push(
+            '-t', String(seg.duration),
+            ...getEncoderArgs(options.encoder, options.preset), '-an', segFile
+          );
+          await runFfmpeg(args);
         } else {
+          const rate =
+            seg.clip.playbackRate && seg.clip.playbackRate > 0 ? seg.clip.playbackRate : 1.0;
+          const rawSourceSpan = Math.max(0.1, seg.clip.sourceOut - seg.clip.sourceIn);
+          const speedPtsPart =
+            Math.abs(rate - 1.0) > 0.01 ? `setpts=PTS/${rate.toFixed(4)},` : '';
+
+          const videoVf =
+            seg.clip.kenBurns === 'star-wars-crawl'
+              ? `${speedPtsPart}${buildStarWarsCrawlFilter(
+                  seg.clip.fitMode,
+                  seg.duration,
+                  width,
+                  height,
+                  fps,
+                  lookVf
+                )}`
+              : `${speedPtsPart}${buildBaseFramingFilter(
+                  seg.clip.fitMode,
+                  width,
+                  height,
+                  seg.duration,
+                  seg.clip.kenBurns
+                )},fps=${fps}${lookVf ? `,${lookVf}` : ''},format=yuv420p`;
+
           await runFfmpeg([
             '-y',
             '-ss',
             String(seg.clip.sourceIn),
             '-t',
-            String(seg.duration),
+            String(rawSourceSpan),
             '-i',
             assetFullPath,
             '-vf',
-            scalePadFilter,
+            videoVf,
+            '-t',
+            String(seg.duration),
             ...getEncoderArgs(options.encoder, options.preset),
             '-an',
             segFile,
@@ -433,14 +544,33 @@ export async function renderProjectWithFfmpeg(
     const dialogueIntervals: Array<{ start: number; end: number }> = [];
 
     for (const track of project.timeline.tracks) {
-      if (track.type === 'video' || track.muted) continue;
+      if (track.muted || track.type === 'text') continue;
+      if (track.type === 'video') {
+        // Scenario 1 (Section 8): Include embedded video audio only when `clip.muteSourceAudio === false`
+        for (const clip of track.clips) {
+          if (clip.muteSourceAudio !== false) continue;
+          const asset = assetMap.get(clip.assetId);
+          if (!asset || asset.kind !== 'video') continue;
+          const fullPath = path.join(projectRoot, asset.relativePath);
+          if (!fs.existsSync(fullPath)) continue;
+          if (!(await hasAudioStream(fullPath))) continue;
+          audioEntries.push({
+            filePath: fullPath,
+            clip,
+            trackVolume: track.volume,
+            trackType: 'video',
+            isNormalized: Boolean(asset.isNormalized),
+          });
+        }
+        continue;
+      }
       for (const clip of track.clips) {
         const asset = assetMap.get(clip.assetId);
         if (!asset) continue;
         const fullPath = path.join(projectRoot, asset.relativePath);
         if (!fs.existsSync(fullPath)) continue;
 
-        const dur = Math.max(0.1, clip.sourceOut - clip.sourceIn);
+        const dur = getClipTimelineDuration(clip);
         if (track.type === 'dialogue') {
           dialogueIntervals.push({
             start: clip.timelineStart,
@@ -519,7 +649,7 @@ export async function renderProjectWithFfmpeg(
         chunk.forEach((entry, index) => {
           const inputIdx = index + 1;
           const clip = entry.clip;
-          const clipDur = Math.max(0.1, Math.round((clip.sourceOut - clip.sourceIn) * 100) / 100);
+          const clipDur = getClipTimelineDuration(clip);
           const clipEnd = clip.timelineStart + clipDur;
           const delayMs = Math.max(0, Math.round(clip.timelineStart * 1000));
           const baseGain = Math.max(0, Math.min(2, entry.trackVolume * (clip.volume ?? 1.0)));
@@ -529,18 +659,27 @@ export async function renderProjectWithFfmpeg(
             `asetpts=PTS-STARTPTS`,
           ];
 
+          const atempoChain = buildAtempoFilterChain(clip.playbackRate || 1.0);
+          if (atempoChain) {
+            chain.push(atempoChain);
+          }
+
           // Topic 12: Vintage Projector / Old Radio band-pass + dynamic range compression
           if (project.lookPreset === 'vintage-film-crackle') {
             chain.push('highpass=f=320,lowpass=f=3200,acompressor=threshold=-18dB:ratio=3:makeup=2');
           }
 
-          // Dynamic narration/dialogue leveling: fixes ElevenLabs clips that trail off soft or jump in loud
+          // Dynamic narration/dialogue leveling: fixes ElevenLabs clips that start with a soft first word or trail off at the end.
+          // `b=1` (`altboundary=true`) initializes the Gaussian window at the clip's peak boundary rather than silence (`0`),
+          // preventing the first word of narration from starting quiet and suddenly jumping up in volume!
           if (
             entry.trackType === 'dialogue' &&
             project.normalizeDialogueAudio !== false &&
             !entry.isNormalized
           ) {
-            chain.push(`dynaudnorm=f=150:g=11:p=0.92:m=6`);
+            chain.push(
+              `acompressor=threshold=-21dB:ratio=2.5:attack=4:release=140:makeup=1.5,dynaudnorm=f=75:g=5:p=0.92:m=8:b=1:s=5`
+            );
           }
 
           // Auto-duck music under active dialogue intervals that overlap this music clip
@@ -662,21 +801,49 @@ export async function renderProjectWithFfmpeg(
       message: 'Finalizing MP4 container into exports/ folder...',
     });
 
-    await runFfmpeg([
+    const finalArgs = [
       '-y',
       '-i',
       stitchedVideoPath,
       '-i',
       mixedAudioPath,
-      '-c:v',
-      'copy',
+    ];
+    const textClips = getTextClips(project);
+    if (textClips.length > 0) {
+      const { renderTextOverlayBitmaps } = await import('./textOverlayRenderer');
+      const bitmaps = await renderTextOverlayBitmaps(textClips.map((clip) => clip.textOverlay), width, height);
+      const filters: string[] = [];
+      textClips.forEach((clip, index) => {
+        const bitmap = bitmaps[index];
+        const bitmapPath = path.join(tempDir, `text_${index}.png`);
+        fs.writeFileSync(bitmapPath, Buffer.from(bitmap.dataUrl.split(',')[1], 'base64'));
+        finalArgs.push('-i', bitmapPath);
+        const { x, y } = getTextPosition(clip.textOverlay, bitmap, width, height);
+        const input = index === 0 ? '0:v' : `text${index - 1}`;
+        const end = clip.timelineStart + getClipTimelineDuration(clip);
+        filters.push(
+          `[${input}][${index + 2}:v]overlay=x=${x}:y=${y}:format=rgb:` +
+          `enable='gte(t,${clip.timelineStart})*lt(t,${end})':eof_action=repeat[text${index}]`
+        );
+      });
+      finalArgs.push(
+        '-filter_complex', filters.join(';'), '-map', `[text${textClips.length - 1}]`,
+        '-map', '1:a:0', ...getEncoderArgs(options.encoder, options.preset), '-pix_fmt', 'yuv420p'
+      );
+    } else {
+      finalArgs.push('-c:v', 'copy');
+    }
+    finalArgs.push(
       '-c:a',
       'copy',
       '-movflags',
       '+faststart',
       '-shortest',
+      '-t',
+      String(totalDuration),
       finalOutputPath,
-    ]);
+    );
+    await runFfmpeg(finalArgs);
 
     onProgress({
       phase: 'complete',
@@ -709,14 +876,29 @@ export function computeAudioTimelineSignature(project: VideoProjectManifest): st
   ];
   const assetMap = new Map<string, ProjectMediaAsset>(project.assets.map((a) => [a.id, a]));
   for (const track of project.timeline.tracks) {
-    if (track.type === 'video') continue;
+    if (track.type === 'text') continue;
+    if (track.type === 'video') {
+      for (const c of track.clips) {
+        if (c.muteSourceAudio === false) {
+          const asset = assetMap.get(c.assetId);
+          parts.push(
+            `vc:${c.id}:${asset?.relativePath || c.assetId}:${asset?.cacheVersion || 0}:${
+              c.timelineStart
+            }:${c.sourceIn}:${c.sourceOut}:${c.playbackRate || 1}:${c.volume}`
+          );
+        }
+      }
+      continue;
+    }
     parts.push(`tr:${track.id}:${track.muted ? 'M' : track.volume}`);
     for (const c of track.clips) {
       const asset = assetMap.get(c.assetId);
       parts.push(
-        `c:${c.id}:${asset?.relativePath || c.assetId}:${c.timelineStart}:${c.sourceIn}:${
-          c.sourceOut
-        }:${c.volume}:${c.fadeIn || 0}:${c.fadeOut || 0}`
+        `c:${c.id}:${asset?.relativePath || c.assetId}:${asset?.cacheVersion || 0}:${
+          c.timelineStart
+        }:${c.sourceIn}:${c.sourceOut}:${c.playbackRate || 1}:${c.volume}:${c.fadeIn || 0}:${
+          c.fadeOut || 0
+        }`
       );
     }
   }
@@ -745,7 +927,7 @@ export async function renderPreviewAudioMixToMp3(
   for (const track of project.timeline.tracks) {
     if (track.muted) continue;
     for (const clip of track.clips) {
-      const end = clip.timelineStart + Math.max(0.1, clip.sourceOut - clip.sourceIn);
+      const end = clip.timelineStart + getClipTimelineDuration(clip);
       if (end > totalDuration) totalDuration = end;
     }
   }
@@ -763,14 +945,32 @@ export async function renderPreviewAudioMixToMp3(
   const dialogueIntervals: Array<{ start: number; end: number }> = [];
 
   for (const track of project.timeline.tracks) {
-    if (track.type === 'video' || track.muted) continue;
+    if (track.muted || track.type === 'text') continue;
+    if (track.type === 'video') {
+      for (const clip of track.clips) {
+        if (clip.muteSourceAudio !== false) continue;
+        const asset = assetMap.get(clip.assetId);
+        if (!asset || asset.kind !== 'video') continue;
+        const fullPath = path.join(projectRoot, asset.relativePath);
+        if (!fs.existsSync(fullPath)) continue;
+        if (!(await hasAudioStream(fullPath))) continue;
+        audioEntries.push({
+          filePath: fullPath,
+          clip,
+          trackVolume: track.volume,
+          trackType: 'video',
+          isNormalized: Boolean(asset.isNormalized),
+        });
+      }
+      continue;
+    }
     for (const clip of track.clips) {
       const asset = assetMap.get(clip.assetId);
       if (!asset) continue;
       const fullPath = path.join(projectRoot, asset.relativePath);
       if (!fs.existsSync(fullPath)) continue;
 
-      const dur = Math.max(0.1, clip.sourceOut - clip.sourceIn);
+      const dur = getClipTimelineDuration(clip);
       if (track.type === 'dialogue') {
         dialogueIntervals.push({ start: clip.timelineStart, end: clip.timelineStart + dur });
       }
@@ -841,7 +1041,7 @@ export async function renderPreviewAudioMixToMp3(
         chunk.forEach((entry, index) => {
           const inputIdx = index + 1;
           const clip = entry.clip;
-          const clipDur = Math.max(0.1, Math.round((clip.sourceOut - clip.sourceIn) * 100) / 100);
+          const clipDur = getClipTimelineDuration(clip);
           const clipEnd = clip.timelineStart + clipDur;
           const delayMs = Math.max(0, Math.round(clip.timelineStart * 1000));
           const baseGain = Math.max(0, Math.min(2, entry.trackVolume * (clip.volume ?? 1.0)));
@@ -851,12 +1051,19 @@ export async function renderPreviewAudioMixToMp3(
             `asetpts=PTS-STARTPTS`,
           ];
 
+          const atempoChain = buildAtempoFilterChain(clip.playbackRate || 1.0);
+          if (atempoChain) {
+            chain.push(atempoChain);
+          }
+
           if (
             entry.trackType === 'dialogue' &&
             project.normalizeDialogueAudio !== false &&
             !entry.isNormalized
           ) {
-            chain.push(`dynaudnorm=f=150:g=11:p=0.92:m=6`);
+            chain.push(
+              `acompressor=threshold=-21dB:ratio=2.5:attack=4:release=140:makeup=1.5,dynaudnorm=f=75:g=5:p=0.92:m=8:b=1:s=5`
+            );
           }
 
           const overlappingIntervals = mergedDialogueIntervals.filter(
@@ -984,8 +1191,9 @@ export async function renderPreviewAudioMixToMp3(
  * Normalises audio clips in the project, writing leveled files into
  * `assets/audio/normalized/` while keeping the original files strictly Read-Only.
  *
- * - Dialogue / Narration: `dynaudnorm=f=125:g=7:p=0.90:m=6` (lifts soft sentence endings & tames jumps)
- * - SFX (when `includeSfxAndMusic` is true): `dynaudnorm=f=200:g=5:p=0.92:m=4` (balances peak SFX loudness)
+ * - Dialogue / Narration: `acompressor` (fast 4ms attack) + `dynaudnorm=f=75:g=5:p=0.92:m=8:b=1:s=5`
+ *   (`b=1` enables `altboundary` so the first word starts at full target gain immediately with zero ramp-up delay!)
+ * - SFX (when `includeSfxAndMusic` is true): `dynaudnorm=f=150:g=5:p=0.92:m=4:b=1` (balances peak SFX loudness)
  * - Music / BGM (when `includeSfxAndMusic` is true): `loudnorm=I=-16:TP=-1.5:LRA=11` (EBU R128 integrated loudness matching so songs match in volume without flattening musical dynamics)
  */
 export async function normalizeDialogueClipsInProject(
@@ -998,6 +1206,7 @@ export async function normalizeDialogueClipsInProject(
   fs.mkdirSync(normDir, { recursive: true });
 
   let normalizedCount = 0;
+  const nowVersion = Date.now();
 
   for (const asset of updated.assets) {
     const isTarget =
@@ -1016,9 +1225,9 @@ export async function normalizeDialogueClipsInProject(
 
     const audioFilter =
       asset.kind === 'dialogue'
-        ? 'dynaudnorm=f=125:g=7:p=0.90:m=6'
+        ? 'acompressor=threshold=-21dB:ratio=2.5:attack=4:release=140:makeup=1.5,dynaudnorm=f=75:g=5:p=0.92:m=8:b=1:s=5'
         : asset.kind === 'sfx'
-        ? 'dynaudnorm=f=200:g=5:p=0.92:m=4'
+        ? 'dynaudnorm=f=150:g=5:p=0.92:m=4:b=1'
         : 'loudnorm=I=-16:TP=-1.5:LRA=11';
 
     await runFfmpeg([
@@ -1037,6 +1246,7 @@ export async function normalizeDialogueClipsInProject(
     asset.originalRelativePath = sourceRel;
     asset.relativePath = outRel;
     asset.isNormalized = true;
+    asset.cacheVersion = nowVersion;
     if (!asset.label.includes('[Norm]')) {
       asset.label = `[Norm] ${asset.label}`;
     }
@@ -1051,6 +1261,7 @@ export async function normalizeDialogueClipsInProject(
     }
   }
   updated.normalizeDialogueAudio = true;
+  updated.preMixedAudioSignature = undefined;
 
   return { project: updated, normalizedCount };
 }
@@ -1109,7 +1320,7 @@ export function generateFcpxmlContent(projectRoot: string, project: VideoProject
   for (const clip of sortedVidClips) {
     const rId = assetResIdMap.get(clip.assetId);
     if (!rId) continue;
-    const dur = Math.max(0.1, clip.sourceOut - clip.sourceIn);
+    const dur = getClipTimelineDuration(clip);
     spineClips.push(
       `            <asset-clip name="${esc(clip.label)}" ref="${rId}" offset="${toRational(
         clip.timelineStart
@@ -1120,7 +1331,7 @@ export function generateFcpxmlContent(projectRoot: string, project: VideoProject
   // Attach audio clips as lane items
   let laneCounter = 1;
   for (const track of project.timeline.tracks) {
-    if (track.type === 'video' || track.muted) continue;
+    if (track.type === 'video' || track.type === 'text' || track.muted) continue;
     for (const clip of track.clips) {
       const rId = assetResIdMap.get(clip.assetId);
       if (!rId) continue;

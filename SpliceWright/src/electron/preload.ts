@@ -3,6 +3,7 @@ import {
   AiMovieSyncSummary,
   ExportOptions,
   ExportProgressEvent,
+  ImportMediaSceneTarget,
   MediaAssetKind,
   SpliceWrightApi,
   StitchCatalogue,
@@ -17,15 +18,25 @@ const api: SpliceWrightApi = {
   openProjectFolder: (folderPath: string) => ipcRenderer.invoke('project:open-folder', folderPath),
   createStandaloneProject: (folderPath: string, title: string, aspectRatio: string) =>
     ipcRenderer.invoke('project:create-standalone', folderPath, title, aspectRatio),
+  convertStandaloneToStudioProject: (projectRoot: string, currentProject: VideoProjectManifest) =>
+    ipcRenderer.invoke('project:convert-to-studio', projectRoot, currentProject),
   saveProject: (projectRoot: string, project: VideoProjectManifest) =>
     ipcRenderer.invoke('project:save', projectRoot, project),
-  importExternalMedia: (projectRoot: string, targetKind: MediaAssetKind) =>
-    ipcRenderer.invoke('project:import-media', projectRoot, targetKind),
+  importExternalMedia: (
+    projectRoot: string,
+    targetKind: MediaAssetKind,
+    sceneTarget?: ImportMediaSceneTarget
+  ) => ipcRenderer.invoke('project:import-media', projectRoot, targetKind, sceneTarget),
   syncFromAiMovie: (
     projectRoot: string,
     currentProject: VideoProjectManifest,
     mode: 'merge-new-assets' | 'reset-to-ai-movie'
   ) => ipcRenderer.invoke('project:sync-ai-movie', projectRoot, currentProject, mode),
+  refreshSingleClipMedia: (
+    projectRoot: string,
+    currentProject: VideoProjectManifest,
+    clipId: string
+  ) => ipcRenderer.invoke('project:refresh-single-clip', projectRoot, currentProject, clipId),
   exportMovie: (projectRoot: string, project: VideoProjectManifest, options: ExportOptions) =>
     ipcRenderer.invoke('project:export-movie', projectRoot, project, options),
   normalizeDialogueAudioClips: (

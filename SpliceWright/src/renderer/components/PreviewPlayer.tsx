@@ -1,5 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  CLIP_FIT_MODE_LABELS,
+  ClipFitMode,
+  getClipTimelineDuration,
   KEN_BURNS_PRESET_LABELS,
   KenBurnsPreset,
   ProjectMediaAsset,
@@ -8,6 +11,8 @@ import {
   VisualLookPreset,
 } from '../../shared/types';
 import { buildMediaUrl, formatTimecode } from '../bridge';
+import { StillImageBackdrop, StillImageForeground } from './StillImageBackground';
+import { TextOverlayEditingProps, TextOverlayLayer } from './TextOverlayLayer';
 
 function computeVisualLookCssFilter(preset: VisualLookPreset | undefined): string {
   switch (preset) {
@@ -26,53 +31,219 @@ function computeVisualLookCssFilter(preset: VisualLookPreset | undefined): strin
   }
 }
 
-function computeKenBurnsTransform(preset: KenBurnsPreset | undefined, progress: number): string {
+function computeMediaFramingAndMotionStyle(
+  fitMode: ClipFitMode | undefined,
+  preset: KenBurnsPreset | undefined,
+  progress: number
+): React.CSSProperties {
   const p = Math.max(0, Math.min(1, progress));
+  const effectiveFit: ClipFitMode =
+    fitMode || (preset === 'star-wars-crawl' ? 'fill-width' : 'contain');
+
+  // 1. Star Wars 3D Perspective Crawl
+  // Note: For 'star-wars-crawl', the 3D perspective plane is applied to the stage wrapper
+  // (which extends `top: -42%` above the screen so the tilted plane reaches the top edge of the monitor),
+  // and the media starts immediately visible at progress=0 and scrolls smoothly upward.
+  if (preset === 'star-wars-crawl') {
+    // Starts with the top of the document visible in the lower-middle of the screen (+24% down)
+    // and scrolls smoothly all the way through (-66%) so there is zero dead black wait time at the start.
+    const ty = 24 - 90 * p;
+    const baseStyle: React.CSSProperties = {
+      position: 'absolute',
+      left: '4%',
+      right: '4%',
+      top: 0,
+      width: '92%',
+      height: effectiveFit === 'stretch-fill' ? '100%' : 'auto',
+      minHeight: '100%',
+      objectFit: effectiveFit === 'stretch-fill' ? 'fill' : 'cover',
+      transformOrigin: 'top center',
+      transform: `translateY(${ty.toFixed(2)}%)`,
+      willChange: 'transform',
+    };
+    return baseStyle;
+  }
+
+  // 2. Fit Full Width (16:9 Wide — scales tall/narrow document screenshots to full viewport width)
+  if (effectiveFit === 'fill-width') {
+    let ty = 0;
+    let tx = 0;
+    let scale = 1;
+    switch (preset) {
+      case 'pan-top-to-bottom':
+        // Scrolls smoothly from top of document to bottom
+        ty = -46 * p;
+        break;
+      case 'pan-bottom-to-top':
+        ty = -46 * (1 - p);
+        break;
+      case 'zoom-in':
+        scale = 1 + 0.18 * p;
+        ty = -20 * p;
+        break;
+      case 'zoom-out':
+        scale = 1.18 - 0.18 * p;
+        ty = -20 * (1 - p);
+        break;
+      case 'pan-left-to-right':
+        scale = 1.15;
+        tx = 6.5 - 13 * p;
+        break;
+      case 'pan-right-to-left':
+        scale = 1.15;
+        tx = -6.5 + 13 * p;
+        break;
+      case 'zoom-in-top-left':
+        scale = 1 + 0.22 * p;
+        tx = 5.5 * p;
+        break;
+      case 'zoom-in-top-right':
+        scale = 1 + 0.22 * p;
+        tx = -5.5 * p;
+        break;
+      case 'zoom-in-bottom':
+        scale = 1 + 0.22 * p;
+        ty = -40 * p;
+        break;
+      default:
+        break;
+    }
+    return {
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      width: '100%',
+      height: 'auto',
+      minHeight: '100%',
+      objectFit: 'cover',
+      transformOrigin: 'top center',
+      transform:
+        scale === 1 && tx === 0 && ty === 0
+          ? 'none'
+          : `scale(${scale.toFixed(4)}) translate(${tx.toFixed(2)}%, ${ty.toFixed(2)}%)`,
+      willChange: 'transform',
+    };
+  }
+
+  // 3. Fit Full Height (9:16 Tall — scales wide clips to full viewport height)
+  if (effectiveFit === 'fill-height') {
+    let tx = 0;
+    let ty = 0;
+    let scale = 1;
+    switch (preset) {
+      case 'pan-left-to-right':
+        tx = -46 * p;
+        break;
+      case 'pan-right-to-left':
+        tx = -46 * (1 - p);
+        break;
+      case 'pan-top-to-bottom':
+        scale = 1.18;
+        ty = 7.5 - 15 * p;
+        break;
+      case 'pan-bottom-to-top':
+        scale = 1.18;
+        ty = -7.5 + 15 * p;
+        break;
+      case 'zoom-in':
+        scale = 1 + 0.18 * p;
+        break;
+      case 'zoom-out':
+        scale = 1.18 - 0.18 * p;
+        break;
+      default:
+        break;
+    }
+    return {
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      height: '100%',
+      width: 'auto',
+      minWidth: '100%',
+      objectFit: 'cover',
+      transformOrigin: 'left center',
+      transform:
+        scale === 1 && tx === 0 && ty === 0
+          ? 'none'
+          : `scale(${scale.toFixed(4)}) translate(${tx.toFixed(2)}%, ${ty.toFixed(2)}%)`,
+      willChange: 'transform',
+    };
+  }
+
+  // 4. Standard 'contain', 'stretch-fill' ('fill'), or 'cover-crop' ('cover')
+  const objectFit: React.CSSProperties['objectFit'] =
+    effectiveFit === 'stretch-fill'
+      ? 'fill'
+      : effectiveFit === 'cover-crop'
+      ? 'cover'
+      : 'contain';
+
+  let transform = 'none';
   switch (preset) {
     case 'zoom-in': {
       const s = 1 + 0.18 * p;
-      return `scale(${s.toFixed(4)})`;
+      transform = `scale(${s.toFixed(4)})`;
+      break;
     }
     case 'zoom-out': {
       const s = 1.18 - 0.18 * p;
-      return `scale(${s.toFixed(4)})`;
+      transform = `scale(${s.toFixed(4)})`;
+      break;
     }
     case 'pan-top-to-bottom': {
       const ty = 9.5 - 19.0 * p;
-      return `scale(1.24) translate(0%, ${ty.toFixed(3)}%)`;
+      transform = `scale(1.24) translate(0%, ${ty.toFixed(3)}%)`;
+      break;
     }
     case 'pan-bottom-to-top': {
       const ty = -9.5 + 19.0 * p;
-      return `scale(1.24) translate(0%, ${ty.toFixed(3)}%)`;
+      transform = `scale(1.24) translate(0%, ${ty.toFixed(3)}%)`;
+      break;
     }
     case 'pan-left-to-right': {
       const tx = 9.0 - 18.0 * p;
-      return `scale(1.22) translate(${tx.toFixed(3)}%, 0%)`;
+      transform = `scale(1.22) translate(${tx.toFixed(3)}%, 0%)`;
+      break;
     }
     case 'pan-right-to-left': {
       const tx = -9.0 + 18.0 * p;
-      return `scale(1.22) translate(${tx.toFixed(3)}%, 0%)`;
+      transform = `scale(1.22) translate(${tx.toFixed(3)}%, 0%)`;
+      break;
     }
     case 'zoom-in-top-left': {
       const s = 1 + 0.24 * p;
       const t = 6.5 * p;
-      return `scale(${s.toFixed(4)}) translate(${t.toFixed(3)}%, ${t.toFixed(3)}%)`;
+      transform = `scale(${s.toFixed(4)}) translate(${t.toFixed(3)}%, ${t.toFixed(3)}%)`;
+      break;
     }
     case 'zoom-in-top-right': {
       const s = 1 + 0.24 * p;
       const tx = -6.5 * p;
       const ty = 6.5 * p;
-      return `scale(${s.toFixed(4)}) translate(${tx.toFixed(3)}%, ${ty.toFixed(3)}%)`;
+      transform = `scale(${s.toFixed(4)}) translate(${tx.toFixed(3)}%, ${ty.toFixed(3)}%)`;
+      break;
     }
     case 'zoom-in-bottom': {
       const s = 1 + 0.24 * p;
       const ty = -6.5 * p;
-      return `scale(${s.toFixed(4)}) translate(0%, ${ty.toFixed(3)}%)`;
+      transform = `scale(${s.toFixed(4)}) translate(0%, ${ty.toFixed(3)}%)`;
+      break;
     }
     case 'none':
     default:
-      return 'none';
+      transform = 'none';
+      break;
   }
+
+  return {
+    width: '100%',
+    height: '100%',
+    objectFit,
+    transform,
+    transformOrigin: 'center center',
+    willChange: 'transform',
+  };
 }
 import {
   Pause,
@@ -86,7 +257,7 @@ import {
   Minimize2,
 } from 'lucide-react';
 
-interface PreviewPlayerProps {
+interface PreviewPlayerProps extends TextOverlayEditingProps {
   projectRoot: string;
   project: VideoProjectManifest;
   playhead: number;
@@ -109,14 +280,29 @@ function computeRendererAudioSignature(project: VideoProjectManifest): string {
   ];
   const assetMap = new Map<string, ProjectMediaAsset>(project.assets.map((a) => [a.id, a]));
   for (const track of project.timeline.tracks) {
-    if (track.type === 'video') continue;
+    if (track.type === 'text') continue;
+    if (track.type === 'video') {
+      for (const c of track.clips) {
+        if (c.muteSourceAudio === false) {
+          const asset = assetMap.get(c.assetId);
+          parts.push(
+            `vc:${c.id}:${asset?.relativePath || c.assetId}:${asset?.cacheVersion || 0}:${
+              c.timelineStart
+            }:${c.sourceIn}:${c.sourceOut}:${c.playbackRate || 1}:${c.volume}`
+          );
+        }
+      }
+      continue;
+    }
     parts.push(`tr:${track.id}:${track.muted ? 'M' : track.volume}`);
     for (const c of track.clips) {
       const asset = assetMap.get(c.assetId);
       parts.push(
-        `c:${c.id}:${asset?.relativePath || c.assetId}:${c.timelineStart}:${c.sourceIn}:${
-          c.sourceOut
-        }:${c.volume}:${c.fadeIn || 0}:${c.fadeOut || 0}`
+        `c:${c.id}:${asset?.relativePath || c.assetId}:${asset?.cacheVersion || 0}:${
+          c.timelineStart
+        }:${c.sourceIn}:${c.sourceOut}:${c.playbackRate || 1}:${c.volume}:${c.fadeIn || 0}:${
+          c.fadeOut || 0
+        }`
       );
     }
   }
@@ -131,6 +317,10 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
   muteAllAudio,
   onPlayheadChange,
   onTogglePlay,
+  selectedClipId,
+  onSelectClip,
+  onUpdateProject,
+  onCommitUndoSnapshot,
 }) => {
   const playerContainerRef = useRef<HTMLDivElement | null>(null);
   const videoARef = useRef<HTMLVideoElement | null>(null);
@@ -206,7 +396,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
     let next: TimelineClip | null = null;
 
     for (const clip of sortedVideoClips) {
-      const dur = Math.max(0.1, clip.sourceOut - clip.sourceIn);
+      const dur = getClipTimelineDuration(clip);
       const end = clip.timelineStart + dur;
       if (playhead >= clip.timelineStart && playhead < end) {
         active = clip;
@@ -222,13 +412,18 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
 
   const activeClipProgress = useMemo(() => {
     if (!activeVideoClip) return 0;
-    const dur = Math.max(0.1, activeVideoClip.sourceOut - activeVideoClip.sourceIn);
+    const dur = getClipTimelineDuration(activeVideoClip);
     return Math.max(0, Math.min(1, (playhead - activeVideoClip.timelineStart) / dur));
   }, [activeVideoClip, playhead]);
 
-  const activeKenBurnsTransform = useMemo(
-    () => computeKenBurnsTransform(activeVideoClip?.kenBurns, activeClipProgress),
-    [activeVideoClip?.kenBurns, activeClipProgress]
+  const activeMediaStyle = useMemo(
+    () =>
+      computeMediaFramingAndMotionStyle(
+        activeVideoClip?.fitMode,
+        activeVideoClip?.kenBurns,
+        activeClipProgress
+      ),
+    [activeVideoClip?.fitMode, activeVideoClip?.kenBurns, activeClipProgress]
   );
 
   // Active dialogue line for live subtitle caption preview
@@ -289,7 +484,11 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
       return;
     }
 
-    const expectedSrc = buildMediaUrl(projectRoot, activeVideoAsset.relativePath);
+    const expectedSrc = buildMediaUrl(
+      projectRoot,
+      activeVideoAsset.relativePath,
+      activeVideoAsset.cacheVersion
+    );
     const clipChanged = lastActiveClipIdRef.current !== activeVideoClip.id;
     const playStateChanged = wasPlayingRef.current !== isPlaying;
 
@@ -318,15 +517,34 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
       seekInFlightRef.current = false;
     }
 
+    const rate =
+      activeVideoClip.playbackRate && activeVideoClip.playbackRate > 0
+        ? activeVideoClip.playbackRate
+        : 1.0;
+    if (Math.abs(currentEl.playbackRate - rate) > 0.01) {
+      currentEl.playbackRate = rate;
+    }
+
+    // Scenario 1 (Section 8): Unmute embedded video audio only when `muteSourceAudio === false` and not muted globally
+    const shouldMuteVideoAudio =
+      Boolean(muteAllAudio) ||
+      Boolean(videoTrack?.muted) ||
+      activeVideoClip.muteSourceAudio !== false;
+    currentEl.muted = shouldMuteVideoAudio;
+    if (!shouldMuteVideoAudio) {
+      const vTrackVol = videoTrack?.volume ?? 1.0;
+      currentEl.volume = Math.max(0, Math.min(1, vTrackVol * (activeVideoClip.volume ?? 1.0)));
+    }
+
     const targetClipTime =
-      activeVideoClip.sourceIn + Math.max(0, playhead - activeVideoClip.timelineStart);
+      activeVideoClip.sourceIn + Math.max(0, playhead - activeVideoClip.timelineStart) * rate;
     const drift = Math.abs(currentEl.currentTime - targetClipTime);
 
-    // Only force hardware keyframe seek if scrubbing, starting playback, switching clips, or if drift > 0.42s
+    // Only force hardware keyframe seek if scrubbing, starting playback, switching clips, or if drift > 0.42s * rate
     const tolerance =
       !isPlaying || clipChanged || playStateChanged
-        ? SCRUB_DRIFT_TOLERANCE_SECONDS
-        : PLAYING_DRIFT_TOLERANCE_SECONDS;
+        ? SCRUB_DRIFT_TOLERANCE_SECONDS * rate
+        : PLAYING_DRIFT_TOLERANCE_SECONDS * rate;
 
     if (drift > tolerance && !seekInFlightRef.current) {
       seekInFlightRef.current = true;
@@ -346,10 +564,11 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
     if (!standbyEl.paused) {
       standbyEl.pause();
     }
+    standbyEl.muted = true;
 
     lastActiveClipIdRef.current = activeVideoClip.id;
     wasPlayingRef.current = isPlaying;
-  }, [projectRoot, activeVideoClip, activeVideoAsset, playhead, isPlaying]);
+  }, [projectRoot, activeVideoClip, activeVideoAsset, playhead, isPlaying, muteAllAudio, videoTrack]);
 
   // Preload upcoming clip into the standby video deck and pre-seek to its `sourceIn`
   useEffect(() => {
@@ -359,7 +578,11 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
       return;
     }
     const standbyEl = activeDeck === 'A' ? vidB : vidA;
-    const nextSrc = buildMediaUrl(projectRoot, nextVideoAsset.relativePath);
+    const nextSrc = buildMediaUrl(
+      projectRoot,
+      nextVideoAsset.relativePath,
+      nextVideoAsset.cacheVersion
+    );
     const targetStart = nextVideoClip.sourceIn || 0;
 
     if (standbyEl.getAttribute('data-media-src') !== nextSrc) {
@@ -466,7 +689,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
 
       activeWindowClipIds.add(clip.id);
       let audioEl = audioRefs.current.get(clip.id);
-      const src = buildMediaUrl(projectRoot, asset.relativePath);
+      const src = buildMediaUrl(projectRoot, asset.relativePath, asset.cacheVersion);
 
       if (!audioEl) {
         audioEl = new Audio(src);
@@ -569,7 +792,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
     let max = 10;
     for (const track of project.timeline.tracks) {
       for (const clip of track.clips) {
-        const end = clip.timelineStart + Math.max(0.1, clip.sourceOut - clip.sourceIn);
+        const end = clip.timelineStart + getClipTimelineDuration(clip);
         if (end > max) max = end;
       }
     }
@@ -578,14 +801,11 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
 
   const aspectStyle: React.CSSProperties = useMemo(() => {
     const ratio = project.format.width / Math.max(1, project.format.height);
-    if (ratio < 1) {
-      // Vertical 9:16
-      return { height: '100%', aspectRatio: `${project.format.width} / ${project.format.height}` };
-    }
     return {
-      width: '100%',
-      maxHeight: '100%',
+      width: `min(100%, calc(100cqh * ${ratio}))`,
       aspectRatio: `${project.format.width} / ${project.format.height}`,
+      boxSizing: 'border-box',
+      flexShrink: 0,
     };
   }, [project.format]);
 
@@ -664,11 +884,13 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
           padding: isFullscreen ? '24px' : '14px',
           position: 'relative',
           overflow: 'hidden',
+          containerType: 'size',
         }}
       >
         <div
           style={{
             ...aspectStyle,
+            containerType: 'inline-size',
             background: '#000',
             borderRadius: '6px',
             border: '1px solid #263248',
@@ -678,60 +900,123 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
             alignItems: 'center',
             justifyContent: 'center',
             boxShadow: '0 10px 30px rgba(0,0,0,0.65)',
-            filter: computeVisualLookCssFilter(project.lookPreset),
           }}
         >
+          <div style={{
+            position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            filter: computeVisualLookCssFilter(project.lookPreset),
+          }}>
+          {activeVideoClip?.missingMedia && (
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                zIndex: 6,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '24px',
+                textAlign: 'center',
+                background: 'radial-gradient(circle, #2a1313 0%, #0b0707 100%)',
+                color: '#fecaca',
+              }}
+            >
+              <Film size={34} color="#ef4444" style={{ marginBottom: '10px', opacity: 0.9 }} />
+              <div style={{ fontSize: '15px', fontWeight: 700, color: '#fee2e2', marginBottom: '6px' }}>
+                Missing media
+              </div>
+              <div style={{ fontSize: '12px', color: '#fca5a5', maxWidth: '75%' }}>
+                {activeVideoClip.label} — the file is missing or was moved to archive/. Switch to another
+                take or re-import the media.
+              </div>
+            </div>
+          )}
           {/* Video Deck A */}
-          <video
-            ref={videoARef}
-            muted
-            playsInline
-            onSeeked={() => {
-              if (activeDeckRef.current === 'A') {
-                seekInFlightRef.current = false;
-              }
-            }}
-            style={{
-              width: '100%',
-              height: '100%',
-              objectFit: 'contain',
-              transform: activeKenBurnsTransform,
-              transformOrigin: 'center center',
-              willChange: 'transform',
-              display:
-                activeVideoAsset && activeVideoAsset.kind === 'video' && activeDeck === 'A'
-                  ? 'block'
-                  : 'none',
-            }}
-          />
+          <div
+            style={
+              activeVideoClip?.kenBurns === 'star-wars-crawl' &&
+              activeVideoAsset?.kind === 'video' &&
+              activeDeck === 'A'
+                ? {
+                    position: 'absolute',
+                    left: '-6%',
+                    right: '-6%',
+                    top: '-42%',
+                    bottom: 0,
+                    overflow: 'hidden',
+                    transformOrigin: '50% 100%',
+                    transform: 'perspective(520px) rotateX(25deg)',
+                  }
+                : { width: '100%', height: '100%', display: activeVideoAsset?.kind === 'video' && activeDeck === 'A' ? 'block' : 'none' }
+            }
+          >
+            <video
+              ref={videoARef}
+              muted
+              playsInline
+              onSeeked={() => {
+                if (activeDeckRef.current === 'A') {
+                  seekInFlightRef.current = false;
+                }
+              }}
+              style={{
+                ...activeMediaStyle,
+                display:
+                  activeVideoAsset && activeVideoAsset.kind === 'video' && activeDeck === 'A'
+                    ? 'block'
+                    : 'none',
+              }}
+            />
+          </div>
 
           {/* Video Deck B (Swaps seamlessly with Deck A on cuts) */}
-          <video
-            ref={videoBRef}
-            muted
-            playsInline
-            onSeeked={() => {
-              if (activeDeckRef.current === 'B') {
-                seekInFlightRef.current = false;
-              }
-            }}
-            style={{
-              width: '100%',
-              height: '100%',
-              objectFit: 'contain',
-              transform: activeKenBurnsTransform,
-              transformOrigin: 'center center',
-              willChange: 'transform',
-              display:
-                activeVideoAsset && activeVideoAsset.kind === 'video' && activeDeck === 'B'
-                  ? 'block'
-                  : 'none',
-            }}
-          />
+          <div
+            style={
+              activeVideoClip?.kenBurns === 'star-wars-crawl' &&
+              activeVideoAsset?.kind === 'video' &&
+              activeDeck === 'B'
+                ? {
+                    position: 'absolute',
+                    left: '-6%',
+                    right: '-6%',
+                    top: '-42%',
+                    bottom: 0,
+                    overflow: 'hidden',
+                    transformOrigin: '50% 100%',
+                    transform: 'perspective(520px) rotateX(25deg)',
+                  }
+                : { width: '100%', height: '100%', display: activeVideoAsset?.kind === 'video' && activeDeck === 'B' ? 'block' : 'none' }
+            }
+          >
+            <video
+              ref={videoBRef}
+              muted
+              playsInline
+              onSeeked={() => {
+                if (activeDeckRef.current === 'B') {
+                  seekInFlightRef.current = false;
+                }
+              }}
+              style={{
+                ...activeMediaStyle,
+                display:
+                  activeVideoAsset && activeVideoAsset.kind === 'video' && activeDeck === 'B'
+                    ? 'block'
+                    : 'none',
+              }}
+            />
+          </div>
 
           {/* Poster / First-Frame Fallback when Scene has an image or First-Frame only */}
           {activeVideoAsset && activeVideoAsset.kind === 'image' && (
             <div style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden' }}>
+              {!activeVideoAsset.isPlaceholderSlate && (
+                <StillImageBackdrop
+                  background={activeVideoClip?.imageBackground || 'black'}
+                  src={buildMediaUrl(projectRoot, activeVideoAsset.relativePath, activeVideoAsset.cacheVersion)}
+                />
+              )}
               {activeVideoAsset.isPlaceholderSlate ? (
                 <div
                   style={{
@@ -755,18 +1040,62 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
                     {activeVideoAsset.dialogueText || 'Scene Slate — Add a first-frame graphic or video in Studio, or drop an image onto this scene.'}
                   </div>
                 </div>
+              ) : activeVideoClip?.kenBurns === 'star-wars-crawl' ? (
+                <>
+                  <div
+                    style={{
+                      position: 'absolute',
+                      left: '-6%',
+                      right: '-6%',
+                      top: '-42%',
+                      bottom: 0,
+                      overflow: 'hidden',
+                      transformOrigin: '50% 100%',
+                      transform: 'perspective(520px) rotateX(25deg)',
+                    }}
+                  >
+                    <img
+                      src={buildMediaUrl(
+                        projectRoot,
+                        activeVideoAsset.relativePath,
+                        activeVideoAsset.cacheVersion
+                      )}
+                      alt={activeVideoAsset.label}
+                      style={activeMediaStyle}
+                    />
+                  </div>
+                  {/* Very gentle top-edge fade anchored to the top 5% of the screen */}
+                  <div
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      right: 0,
+                      height: '5%',
+                      background: 'linear-gradient(to bottom, #000000 0%, transparent 100%)',
+                      pointerEvents: 'none',
+                    }}
+                  />
+                </>
+              ) : activeVideoClip?.imageBackground ? (
+                <StillImageForeground
+                  src={buildMediaUrl(projectRoot, activeVideoAsset.relativePath, activeVideoAsset.cacheVersion)}
+                  label={activeVideoAsset.label}
+                  clip={activeVideoClip}
+                  progress={activeClipProgress}
+                  width={project.format.width}
+                  height={project.format.height}
+                  fps={project.format.fps}
+                />
               ) : (
                 <img
-                  src={buildMediaUrl(projectRoot, activeVideoAsset.relativePath)}
+                  src={buildMediaUrl(
+                    projectRoot,
+                    activeVideoAsset.relativePath,
+                    activeVideoAsset.cacheVersion
+                  )}
                   alt={activeVideoAsset.label}
-                  style={{
-                    width: '100%',
-                    height: '100%',
-                    objectFit: 'contain',
-                    transform: activeKenBurnsTransform,
-                    transformOrigin: 'center center',
-                    willChange: 'transform',
-                  }}
+                  style={activeMediaStyle}
                 />
               )}
               {activeVideoAsset.isPosterFallback && !activeVideoAsset.isPlaceholderSlate && (
@@ -786,25 +1115,56 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
                   First-Frame Poster Hold (Awaiting Scene Video)
                 </div>
               )}
-              {activeVideoClip?.kenBurns && activeVideoClip.kenBurns !== 'none' && (
-                <div
-                  style={{
-                    position: 'absolute',
-                    top: '10px',
-                    left: '10px',
-                    background: 'rgba(12, 74, 110, 0.85)',
-                    border: '1px solid #38bdf8',
-                    color: '#e0f2fe',
-                    fontSize: '11px',
-                    padding: '3px 8px',
-                    borderRadius: '4px',
-                  }}
-                >
-                  Motion: {KEN_BURNS_PRESET_LABELS[activeVideoClip.kenBurns]}
-                </div>
-              )}
             </div>
           )}
+
+          {/* Motion & Framing Overlay Badge (shown for both images and videos when non-default) */}
+          {activeVideoAsset &&
+            !activeVideoAsset.isPlaceholderSlate &&
+            ((activeVideoClip?.kenBurns && activeVideoClip.kenBurns !== 'none') ||
+              (activeVideoClip?.fitMode && activeVideoClip.fitMode !== 'contain')) && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '10px',
+                  left: '10px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '4px',
+                  pointerEvents: 'none',
+                  zIndex: 5,
+                }}
+              >
+                {activeVideoClip?.kenBurns && activeVideoClip.kenBurns !== 'none' && (
+                  <div
+                    style={{
+                      background: 'rgba(12, 74, 110, 0.85)',
+                      border: '1px solid #38bdf8',
+                      color: '#e0f2fe',
+                      fontSize: '11px',
+                      padding: '3px 8px',
+                      borderRadius: '4px',
+                    }}
+                  >
+                    Motion: {KEN_BURNS_PRESET_LABELS[activeVideoClip.kenBurns]}
+                  </div>
+                )}
+                {activeVideoClip?.fitMode && activeVideoClip.fitMode !== 'contain' && (
+                  <div
+                    style={{
+                      background: 'rgba(30, 41, 59, 0.88)',
+                      border: '1px solid #a855f7',
+                      color: '#f3e8ff',
+                      fontSize: '11px',
+                      padding: '3px 8px',
+                      borderRadius: '4px',
+                    }}
+                  >
+                    Fit: {CLIP_FIT_MODE_LABELS[activeVideoClip.fitMode]}
+                  </div>
+                )}
+              </div>
+            )}
 
           {/* Empty state when playhead is on a blank segment */}
           {!activeVideoAsset && (
@@ -864,6 +1224,16 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
               </span>
             </div>
           )}
+          </div>
+          <TextOverlayLayer
+            project={project}
+            playhead={playhead}
+            selectedClipId={selectedClipId}
+            onSelectClip={onSelectClip}
+            onUpdateProject={onUpdateProject}
+            onCommitUndoSnapshot={onCommitUndoSnapshot}
+            onStartDrag={() => { if (isPlaying) onTogglePlay(); }}
+          />
         </div>
       </div>
 

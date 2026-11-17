@@ -1,14 +1,21 @@
 import fs from 'fs';
 import path from 'path';
 import {
+  AiMovieAudioAsset,
   AiMovieManifest,
+  AiMovieScene,
   AiMovieSyncSummary,
+  AiMovieVideoTake,
+  getClipTimelineDuration,
   KenBurnsPreset,
   LoadedProjectBundle,
   MediaAssetKind,
   ProjectMediaAsset,
   StitchCatalogue,
   StitchVideoItem,
+  StudioUpdateAddedAssetEntry,
+  StudioUpdatesManifest,
+  StudioUpdateSceneTimelineEntry,
   TimelineClip,
   TimelineMarker,
   TimelineTrack,
@@ -17,9 +24,39 @@ import {
   VideoProjectSequenceItem,
   VisualLookPreset,
 } from '../shared/types';
-import { probeMediaDuration } from './hardware';
+import { extractVideoFrameToPng, probeMediaDuration } from './hardware';
+import { createDefaultTextOverlay } from '../shared/textOverlay';
 
 const DIALOGUE_PAUSE_SECONDS = 0.25;
+
+function applyStudioTextOverlayDefaults(project: VideoProjectManifest, aiMovie: AiMovieManifest): boolean {
+  const applied = new Set(project.studioTextOverlayDefaultsApplied || []);
+  const videoTrack = project.timeline.tracks.find((track) => track.type === 'video');
+  let textTrack = project.timeline.tracks.find((track) => track.type === 'text');
+  let modified = false;
+  for (const scene of aiMovie.scenes) {
+    const text = scene.defaultTextOverlay;
+    if (typeof text !== 'string' || !text.trim() || applied.has(scene.id)) continue;
+    const visuals = videoTrack?.clips.filter((clip) => clip.sceneId === scene.id) || [];
+    if (visuals.length === 0) continue;
+    const start = Math.min(...visuals.map((clip) => clip.timelineStart));
+    const end = Math.max(...visuals.map((clip) => clip.timelineStart + getClipTimelineDuration(clip)));
+    if (!textTrack) {
+      textTrack = { id: 'track_text', type: 'text', name: 'Text Overlays', volume: 1, muted: false, clips: [] };
+      project.timeline.tracks.push(textTrack);
+    }
+    textTrack.clips.push({
+      id: `text_studio_${scene.id}`, assetId: '', trackId: textTrack.id, sceneId: scene.id,
+      label: text.split(/\r\n|\r|\n/)[0].slice(0, 60) || 'Text',
+      timelineStart: start, sourceIn: 0, sourceOut: Math.round((end - start) * 100) / 100, volume: 1,
+      textOverlay: createDefaultTextOverlay(text, project.format.height),
+    });
+    applied.add(scene.id);
+    modified = true;
+  }
+  if (modified) project.studioTextOverlayDefaultsApplied = Array.from(applied);
+  return modified;
+}
 
 export function inferLookPresetFromColorGrade(colorGrade?: string): VisualLookPreset {
   if (!colorGrade) return 'none';
@@ -80,6 +117,9 @@ export function inferKenBurnsFromCameraDirection(
   if (text.includes('static') || text.includes('locked') || text.includes('still')) {
     return 'none';
   }
+  if (text.includes('star wars') || text.includes('starwars') || text.includes('crawl')) {
+    return 'star-wars-crawl';
+  }
   if (text.includes('zoom out') || text.includes('pull back') || text.includes('pull-back') || text.includes('reveal')) {
     return 'zoom-out';
   }
@@ -112,6 +152,55 @@ export function inferKenBurnsFromCameraDirection(
 
 export function normalizeRelPath(inputPath: string): string {
   return inputPath.replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+/** Studio moves deleted media under `archive/<relative-path>`; the editor must never use those files. */
+export function isArchivedRelPath(relPath: string): boolean {
+  return /^archive(\/|$)/i.test(normalizeRelPath(relPath));
+}
+
+/** True when the file exists on disk and is not inside the project's `archive/` folder. */
+export function isUsableMediaFile(projectRoot: string, relPath: string): boolean {
+  if (!relPath || relPath.startsWith('__slate__/') || isArchivedRelPath(relPath)) return false;
+  try {
+    return fs.statSync(path.join(projectRoot, relPath)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Checks the file signature so a poster that is really an MP4 (or other non-image) is rejected.
+ * Accepts PNG (`89 50 4E 47`), JPEG (`FF D8 FF`) and WebP (`RIFF....WEBP`).
+ */
+export function hasImageSignature(fullPath: string): boolean {
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(fullPath, 'r');
+    const buf = Buffer.alloc(12);
+    const read = fs.readSync(fd, buf, 0, 12, 0);
+    if (read < 4) return false;
+    const isPng = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+    const isJpeg = buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+    const isWebp =
+      read >= 12 &&
+      buf.toString('ascii', 0, 4) === 'RIFF' &&
+      buf.toString('ascii', 8, 12) === 'WEBP';
+    return isPng || isJpeg || isWebp;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+/** Usable poster = existing, non-archived file whose content is genuinely an image. */
+export function isUsablePosterFile(projectRoot: string, relPath: string): boolean {
+  return isUsableMediaFile(projectRoot, relPath) && hasImageSignature(path.join(projectRoot, relPath));
 }
 
 export function resolveAspectRatioFormat(aspectRatio?: string): VideoProjectFormat {
@@ -308,23 +397,28 @@ export async function buildProjectFromAiMovie(
     } else {
       for (const ext of ['png', 'jpg', 'jpeg', 'webp']) {
         const candidate = `scenes/${scene.id}/first-frame.${ext}`;
-        if (fs.existsSync(path.join(projectRoot, candidate))) {
+        if (isUsablePosterFile(projectRoot, candidate)) {
           posterRelPath = candidate;
           break;
         }
       }
     }
 
+    // A poster must be a real image on disk (e.g. a `first-frame.png` that is really an MP4 is treated as missing)
+    if (posterRelPath && !isUsablePosterFile(projectRoot, posterRelPath)) {
+      posterRelPath = null;
+    }
+
     // Fallback: check if scene.notes references an image in `assets/images/...`
-    if ((!posterRelPath || !fs.existsSync(path.join(projectRoot, posterRelPath))) && typeof scene.notes === 'string') {
+    if (!posterRelPath && typeof scene.notes === 'string') {
       const imgMatch = scene.notes.match(/(assets\/images\/[^\s,;)]+\.(?:png|jpg|jpeg|webp))/i);
-      if (imgMatch && fs.existsSync(path.join(projectRoot, imgMatch[1]))) {
+      if (imgMatch && isUsablePosterFile(projectRoot, imgMatch[1])) {
         posterRelPath = normalizeRelPath(imgMatch[1]);
       }
     }
 
     let posterAssetId: string | null = null;
-    if (posterRelPath && fs.existsSync(path.join(projectRoot, posterRelPath))) {
+    if (posterRelPath) {
       posterAssetId = `asset_${scene.id}_poster`;
       assets.push({
         id: posterAssetId,
@@ -338,20 +432,26 @@ export async function buildProjectFromAiMovie(
       });
     }
 
-    // 2. Resolve Scene Video Takes (`scenes/<scene-id>/videos/video-<timestamp>.mp4`)
+    // 2. Resolve Scene Video Takes (`scenes/<scene-id>/videos/video-<timestamp>.mp4` or shared `assets/video/<file>`)
     const sceneTakeAssetIds: string[] = [];
+    const sceneTakesByAssetId = new Map<string, AiMovieVideoTake>();
     const alternateVideos: VideoProjectSequenceItem['alternateVideos'] = [];
     const registeredSceneVideoPaths = new Set<string>();
 
     for (let tIdx = 0; tIdx < (scene.videos || []).length; tIdx++) {
       const take = scene.videos![tIdx];
-      const relPath = take.fileName.startsWith('scenes/')
-        ? normalizeRelPath(take.fileName)
-        : normalizeRelPath(`scenes/${scene.id}/videos/${path.basename(take.fileName)}`);
+      const relPath =
+        take.fileName.startsWith('scenes/') ||
+        take.fileName.startsWith('assets/') ||
+        take.fileName.startsWith('videos/')
+          ? normalizeRelPath(take.fileName)
+          : normalizeRelPath(`scenes/${scene.id}/videos/${path.basename(take.fileName)}`);
 
       const fullVideoPath = path.join(projectRoot, relPath);
+      // Register only media that exists (takes moved to `archive/` or deleted must not become assets)
+      if (!isUsableMediaFile(projectRoot, relPath)) continue;
       const probedDur =
-        (!take.durationSeconds || take.durationSeconds <= 0) && fs.existsSync(fullVideoPath)
+        (!take.durationSeconds || take.durationSeconds <= 0)
           ? await probeMediaDuration(fullVideoPath)
           : take.durationSeconds;
 
@@ -369,6 +469,7 @@ export async function buildProjectFromAiMovie(
         source: 'ai-movie',
       });
       sceneTakeAssetIds.push(assetId);
+      sceneTakesByAssetId.set(assetId, take);
       registeredSceneVideoPaths.add(relPath);
     }
 
@@ -404,6 +505,7 @@ export async function buildProjectFromAiMovie(
     // Include storyboard takes linked to this scene
     const sbTakes = storyboardsByScene.get(scene.id) || [];
     for (const sbTake of sbTakes) {
+      if (!isUsableMediaFile(projectRoot, sbTake.videoRelPath)) continue;
       const assetId = `asset_${scene.id}_sb_${sbTake.videoId}`;
       assets.push({
         id: assetId,
@@ -442,72 +544,47 @@ export async function buildProjectFromAiMovie(
       heroAssetId = posterAssetId;
     }
 
-    // 3. Resolve Audio Assets (`scene.audioAssets[]` AND `audio/<scene-id>/` on disk)
-    // Per Section 7.3: exclude `rejected`, and if multiple takes exist for the same dialogue line, prefer `approved`.
-    const nonRejectedAudio = (scene.audioAssets || []).filter((a) => a.status !== 'rejected');
-    const approvedLines = new Set<string>();
+    // 3. Resolve Audio Assets from `scene.audioAssets[]` only (loose files in `audio/<scene-id>/` are never timeline audio)
+    // Per Section 7.3, 7.5 & Section 8.3: exclude `rejected`, drop clips whose file is missing or archived, and for
+    // multi-character exchanges or multiple takes of the same dialogue line
+    // (`(characterId || '') + ':' + dialogueLine.toLowerCase()`), keep only the single latest `status === 'approved'`
+    // take (or the latest non-rejected take) per distinct line.
+    const resolveSceneAudioRelPath = (aud: AiMovieAudioAsset): string => {
+      let relPath =
+        aud.fileName.startsWith('audio/') || aud.fileName.startsWith('assets/')
+          ? normalizeRelPath(aud.fileName)
+          : normalizeRelPath(`audio/${scene.id}/${path.basename(aud.fileName)}`);
+      // If `audio/<scene-id>/<file>` is missing, check `assets/audio/<file>` fallback
+      if (!isUsableMediaFile(projectRoot, relPath)) {
+        const fallbackInAssets = normalizeRelPath(`assets/audio/${path.basename(aud.fileName)}`);
+        if (isUsableMediaFile(projectRoot, fallbackInAssets)) {
+          relPath = fallbackInAssets;
+        }
+      }
+      return relPath;
+    };
+    const nonRejectedAudio = (scene.audioAssets || []).filter(
+      (a) => a.status !== 'rejected' && isUsableMediaFile(projectRoot, resolveSceneAudioRelPath(a))
+    );
+    const chosenDlgTakeByLineKey = new Map<string, string>();
     for (const a of nonRejectedAudio) {
-      if (
-        (a.kind === 'dialogue' || a.kind === 'voiceover') &&
-        a.status === 'approved' &&
-        a.dialogueLine
-      ) {
-        approvedLines.add(`${a.characterId || ''}::${a.dialogueLine.trim().toLowerCase()}`);
+      if ((a.kind === 'dialogue' || a.kind === 'voiceover') && a.dialogueLine) {
+        const key = `${a.characterId || ''}:${a.dialogueLine.trim().toLowerCase()}`;
+        const prevId = chosenDlgTakeByLineKey.get(key);
+        const prevAsset = prevId ? nonRejectedAudio.find((x) => x.id === prevId) : undefined;
+        // Prefer 'approved' over 'generated', and if both have the same status, prefer the latest take (`a`)
+        if (!prevAsset || a.status === 'approved' || prevAsset.status !== 'approved') {
+          chosenDlgTakeByLineKey.set(key, a.id);
+        }
       }
     }
     const validAudio = nonRejectedAudio.filter((a) => {
-      if (
-        (a.kind === 'dialogue' || a.kind === 'voiceover') &&
-        a.dialogueLine &&
-        a.status !== 'approved'
-      ) {
-        const key = `${a.characterId || ''}::${a.dialogueLine.trim().toLowerCase()}`;
-        if (approvedLines.has(key)) {
-          return false; // Prefer the approved take for this dialogue line
-        }
+      if ((a.kind === 'dialogue' || a.kind === 'voiceover') && a.dialogueLine) {
+        const key = `${a.characterId || ''}:${a.dialogueLine.trim().toLowerCase()}`;
+        return chosenDlgTakeByLineKey.get(key) === a.id;
       }
       return true;
     });
-    const registeredAudioPaths = new Set<string>();
-    for (const a of validAudio) {
-      const norm = a.fileName.startsWith('audio/') || a.fileName.startsWith('assets/')
-        ? normalizeRelPath(a.fileName)
-        : normalizeRelPath(`audio/${scene.id}/${path.basename(a.fileName)}`);
-      registeredAudioPaths.add(norm);
-    }
-
-    // Also scan `audio/<scene-id>/` on disk so any generated MP3/WAV in `audio/<scene-id>/` is ALWAYS found
-    const sceneAudioDir = path.join(projectRoot, 'audio', scene.id);
-    if (fs.existsSync(sceneAudioDir)) {
-      const diskAudioFiles = fs.readdirSync(sceneAudioDir).sort();
-      const sceneDialogueLines = (scene.dialogue || '')
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .filter(Boolean);
-
-      let diskIdx = 0;
-      for (const file of diskAudioFiles) {
-        const ext = path.extname(file).toLowerCase();
-        if (!['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac'].includes(ext)) continue;
-        const relPath = normalizeRelPath(`audio/${scene.id}/${file}`);
-        if (registeredAudioPaths.has(relPath)) continue;
-
-        const baseId = path.basename(file, ext);
-        const inferredLine = sceneDialogueLines[diskIdx] || scene.dialogue || scene.title;
-        diskIdx++;
-
-        validAudio.push({
-          id: baseId,
-          kind: 'dialogue',
-          fileName: relPath,
-          dialogueLine: inferredLine,
-          characterId: scene.characterIds?.[0],
-          durationSeconds: 0,
-          status: 'generated',
-        });
-        registeredAudioPaths.add(relPath);
-      }
-    }
 
     let dialogueOffsetInScene = 0;
     const sequenceDialogue: VideoProjectSequenceItem['dialogue'] = [];
@@ -516,22 +593,11 @@ export async function buildProjectFromAiMovie(
 
     let dialogueIndex = 0;
     for (const aud of validAudio) {
-      let relPath =
-        aud.fileName.startsWith('audio/') || aud.fileName.startsWith('assets/')
-          ? normalizeRelPath(aud.fileName)
-          : normalizeRelPath(`audio/${scene.id}/${path.basename(aud.fileName)}`);
-
-      // If `audio/<scene-id>/<file>` is missing, check `assets/audio/<file>` fallback
-      if (!fs.existsSync(path.join(projectRoot, relPath))) {
-        const fallbackInAssets = normalizeRelPath(`assets/audio/${path.basename(aud.fileName)}`);
-        if (fs.existsSync(path.join(projectRoot, fallbackInAssets))) {
-          relPath = fallbackInAssets;
-        }
-      }
+      const relPath = resolveSceneAudioRelPath(aud);
 
       const fullAudioPath = path.join(projectRoot, relPath);
       let duration = aud.durationSeconds || 0;
-      if ((!duration || duration <= 0) && fs.existsSync(fullAudioPath)) {
+      if (!duration || duration <= 0) {
         duration = await probeMediaDuration(fullAudioPath);
       }
       duration = Math.round((duration || 2.5) * 100) / 100;
@@ -651,13 +717,35 @@ export async function buildProjectFromAiMovie(
     }
 
     // 4. Determine Scene Timeline Span & Place Hero Video Clip (or Scene Slate if no graphic yet)
+    // Scenario 1 (Section 8): Non-destructive sub-clips (`sourceInSeconds`, `sourceOutSeconds`, `playbackRate`, `muteSourceAudio`, `segments[]`)
+    // Scenario 2 (Section 8): Automatic Multi-Scene Audio Spanning — if Scene N has dialogue > sceneN.durationSeconds
+    // and subsequent scenes N+1..N+k have no dialogue of their own, Scene N's visual clip stays at `sceneN.durationSeconds`
+    // so Scenes N+1..N+k cut visually over Scene N's continuing narration!
     const scenePanels = panelsByScene.get(scene.id) || [];
     const primaryCameraDir = scenePanels.find((p) => p.cameraDirection)?.cameraDirection || scene.summary;
 
     const totalDialogueSpan =
       dialogueOffsetInScene > 0 ? Math.max(0, dialogueOffsetInScene - DIALOGUE_PAUSE_SECONDS) : 0;
     const targetDuration = scene.durationSeconds || 5;
-    const effectiveStillSpan = Math.max(targetDuration, Math.ceil(totalDialogueSpan));
+
+    // Check whether the next scene in sequence is a silent continuation scene (no dialogue of its own)
+    const sceneHasNonRejectedDialogue = (sc: AiMovieScene): boolean =>
+      (sc.audioAssets || []).some((a) => {
+        if (a.status === 'rejected' || (a.kind !== 'dialogue' && a.kind !== 'voiceover')) return false;
+        const rel =
+          a.fileName.startsWith('audio/') || a.fileName.startsWith('assets/')
+            ? normalizeRelPath(a.fileName)
+            : normalizeRelPath(`audio/${sc.id}/${path.basename(a.fileName)}`);
+        return (
+          isUsableMediaFile(projectRoot, rel) ||
+          isUsableMediaFile(projectRoot, `assets/audio/${path.basename(a.fileName)}`)
+        );
+      });
+
+    const nextSceneEntry = orderedScenes[idx + 1];
+    const nextSceneIsSilentContinuation = Boolean(
+      nextSceneEntry && !sceneHasNonRejectedDialogue(nextSceneEntry.scene)
+    );
 
     if (!heroAssetId) {
       const slateAssetId = `asset_${scene.id}_slate`;
@@ -666,7 +754,7 @@ export async function buildProjectFromAiMovie(
         kind: 'image',
         label: `[${scene.title}] Scene Slate (No Graphic Yet)`,
         relativePath: `__slate__/${scene.id}`,
-        durationSeconds: effectiveStillSpan,
+        durationSeconds: targetDuration,
         sceneId: scene.id,
         dialogueText: scene.summary || scene.title,
         source: 'ai-movie',
@@ -678,15 +766,33 @@ export async function buildProjectFromAiMovie(
     }
 
     const heroAsset = assets.find((a) => a.id === heroAssetId) || null;
+    const heroTakeSpec = heroAssetId ? sceneTakesByAssetId.get(heroAssetId) : undefined;
+    const defaultMuteSource =
+      heroTakeSpec?.muteSourceAudio !== undefined
+        ? heroTakeSpec.muteSourceAudio
+        : sequenceDialogue.length > 0;
+
+    // Compute how much earlier spanning audio from an Anchor Scene is still playing when this scene starts
+    const dialogueTrackEndSoFar = dialogueTrack.clips.reduce(
+      (maxEnd, c) => Math.max(maxEnd, c.timelineStart + getClipTimelineDuration(c)),
+      0
+    );
+    const remainingSpanningAudioAtSceneStart = Math.max(0, dialogueTrackEndSoFar - sceneStart);
+
+    // Under Scenario 2:
+    // - If `nextSceneIsSilentContinuation` is true, do NOT stretch this scene's still poster to cover all of `remainingSpanningAudioAtSceneStart`;
+    //   let this scene play for `targetDuration` so the next silent scene cuts in on time over the continuing audio!
+    // - Only if this is the LAST scene in the audio span (`!nextSceneIsSilentContinuation`) and the audio still exceeds `sceneStart + targetDuration`
+    //   should this final scene extend its still hold so the audio finishes before the next voiced scene starts.
+    const requiredStillDuration = nextSceneIsSilentContinuation
+      ? targetDuration
+      : Math.max(targetDuration, Math.ceil(remainingSpanningAudioAtSceneStart));
+
     if (heroAsset && heroAsset.isPosterFallback) {
-      heroAsset.durationSeconds = effectiveStillSpan;
+      heroAsset.durationSeconds = requiredStillDuration;
     }
 
-    const clipDuration = heroAsset
-      ? heroAsset.isPosterFallback
-        ? effectiveStillSpan
-        : heroAsset.durationSeconds
-      : effectiveStillSpan;
+    let clipDuration = requiredStillDuration;
 
     if (heroAsset) {
       const isStillHero =
@@ -697,22 +803,88 @@ export async function buildProjectFromAiMovie(
         : heroAsset.isPosterFallback
         ? 'Poster Frame'
         : 'Video';
-      videoTrack.clips.push({
-        id: `clip_vid_${scene.id}`,
-        assetId: heroAsset.id,
-        trackId: videoTrack.id,
-        sceneId: scene.id,
-        sceneOrder,
-        label: `${scene.title} (${suffix})`,
-        timelineStart: Math.round(sceneStart * 100) / 100,
-        sourceIn: 0,
-        sourceOut: clipDuration,
-        volume: 1.0,
-        kenBurns: isStillHero
-          ? inferKenBurnsFromCameraDirection(primaryCameraDir, 'zoom-in')
-          : 'none',
-        availableTakeAssetIds: sceneTakeAssetIds,
-      });
+      const explicitFitMode = heroTakeSpec?.fitMode || scene.properties?.fitMode;
+      const explicitKenBurns = heroTakeSpec?.kenBurns || scene.properties?.kenBurns;
+
+      if (
+        !heroAsset.isPosterFallback &&
+        heroTakeSpec?.segments &&
+        heroTakeSpec.segments.length > 0
+      ) {
+        // Scenario 1: Multi-segment sub-clips (e.g. normal speed -> 3x speed ramp within the same sceneId)
+        let segCursor = sceneStart;
+        heroTakeSpec.segments.forEach((seg, sIdx) => {
+          const segIn = Math.max(0, seg.sourceInSeconds ?? 0);
+          const segOut = Math.max(
+            segIn + 0.2,
+            seg.sourceOutSeconds ?? heroAsset.durationSeconds
+          );
+          const segRate = seg.playbackRate && seg.playbackRate > 0 ? seg.playbackRate : 1.0;
+          const segEffectiveDur = Math.max(0.1, Math.round(((segOut - segIn) / segRate) * 100) / 100);
+          videoTrack.clips.push({
+            id: sIdx === 0 ? `clip_vid_${scene.id}` : `clip_vid_${scene.id}_seg_${sIdx + 1}`,
+            assetId: heroAsset.id,
+            trackId: videoTrack.id,
+            sceneId: scene.id,
+            sceneOrder,
+            label:
+              heroTakeSpec.segments!.length > 1
+                ? `${scene.title} (${suffix} • Part ${sIdx + 1})`
+                : `${scene.title} (${suffix})`,
+            timelineStart: Math.round(segCursor * 100) / 100,
+            sourceIn: segIn,
+            sourceOut: segOut,
+            playbackRate: segRate,
+            muteSourceAudio: defaultMuteSource,
+            volume: 1.0,
+            fitMode: explicitFitMode,
+            kenBurns: explicitKenBurns || 'none',
+            availableTakeAssetIds: sceneTakeAssetIds,
+          });
+          segCursor = Math.round((segCursor + segEffectiveDur) * 100) / 100;
+        });
+        clipDuration = Math.max(0.2, Math.round((segCursor - sceneStart) * 100) / 100);
+      } else {
+        const srcIn =
+          !heroAsset.isPosterFallback && typeof heroTakeSpec?.sourceInSeconds === 'number'
+            ? Math.max(0, heroTakeSpec.sourceInSeconds)
+            : 0;
+        const srcOut = heroAsset.isPosterFallback
+          ? requiredStillDuration
+          : typeof heroTakeSpec?.sourceOutSeconds === 'number' &&
+            heroTakeSpec.sourceOutSeconds > srcIn
+          ? heroTakeSpec.sourceOutSeconds
+          : heroAsset.durationSeconds;
+        const rate =
+          !heroAsset.isPosterFallback &&
+          heroTakeSpec?.playbackRate &&
+          heroTakeSpec.playbackRate > 0
+            ? heroTakeSpec.playbackRate
+            : 1.0;
+        clipDuration = Math.max(0.1, Math.round(((srcOut - srcIn) / rate) * 100) / 100);
+
+        videoTrack.clips.push({
+          id: `clip_vid_${scene.id}`,
+          assetId: heroAsset.id,
+          trackId: videoTrack.id,
+          sceneId: scene.id,
+          sceneOrder,
+          label: `${scene.title} (${suffix})`,
+          timelineStart: Math.round(sceneStart * 100) / 100,
+          sourceIn: srcIn,
+          sourceOut: srcOut,
+          playbackRate: rate,
+          muteSourceAudio: defaultMuteSource,
+          volume: 1.0,
+          fitMode: explicitFitMode,
+          kenBurns:
+            explicitKenBurns ||
+            (isStillHero
+              ? inferKenBurnsFromCameraDirection(primaryCameraDir, 'zoom-in')
+              : 'none'),
+          availableTakeAssetIds: sceneTakeAssetIds,
+        });
+      }
     }
 
     // 5. Add Storyboard SFX & Camera Cue Markers along this scene
@@ -776,13 +948,18 @@ export async function buildProjectFromAiMovie(
       music: sequenceMusic,
     });
 
-    timelineCursor = Math.round((sceneStart + Math.max(clipDuration, totalDialogueSpan)) * 100) / 100;
+    // Scenario 2 (Section 8): If the next scene is a silent continuation scene (`nextSceneIsSilentContinuation`),
+    // advance `timelineCursor` by `clipDuration` (not `totalDialogueSpan`) so the next scene's visual cuts in over Scene N's audio!
+    const nextSceneAdvance = nextSceneIsSilentContinuation
+      ? clipDuration
+      : Math.max(clipDuration, remainingSpanningAudioAtSceneStart, totalDialogueSpan);
+    timelineCursor = Math.round((sceneStart + nextSceneAdvance) * 100) / 100;
   }
 
   // 6. Scan `assets/audio/` and `assets/video/` for any shared BGM, SFX, or video clips
   await scanSharedAssetsFolder(projectRoot, assets, activeSceneIds);
 
-  return {
+  const project: VideoProjectManifest = {
     schemaVersion: '1.0',
     appName: 'SpliceWright',
     projectMode: 'ai-movie',
@@ -800,6 +977,8 @@ export async function buildProjectFromAiMovie(
     },
     sequence,
   };
+  applyStudioTextOverlayDefaults(project, aiMovie);
+  return project;
 }
 
 export async function scanSharedAssetsFolder(
@@ -868,12 +1047,12 @@ export async function scanSharedAssetsFolder(
     for (const entry of entries) {
       if (entry.isDirectory()) {
         if (isArchiveOrIgnoredFolderName(entry.name)) continue;
-        // If `ai-movie.json` is active and a `scene-*` folder is no longer in `activeSceneIds` (e.g. scene-2 deleted), skip it
+        // Scene audio comes only from `scene.audioAssets[]` when `ai-movie.json` is active, so loose files
+        // in `audio/<scene-id>/` (original download names, duplicate copies) are never registered here.
         if (
           activeSceneIds &&
           activeSceneIds.size > 0 &&
-          entry.name.toLowerCase().startsWith('scene-') &&
-          !activeSceneIds.has(entry.name)
+          (activeSceneIds.has(entry.name) || entry.name.toLowerCase().startsWith('scene-'))
         ) {
           continue;
         }
@@ -1087,7 +1266,130 @@ export function saveVideoProjectManifest(
   const targetPath = getVideoProjectPath(projectRoot);
   project.updatedAt = new Date().toISOString();
   fs.writeFileSync(targetPath, JSON.stringify(project, null, 2), 'utf-8');
+  writeStudioUpdatesManifest(projectRoot, project);
   return targetPath;
+}
+
+/**
+ * Writes `exports/studio-updates.json` (Editor -> Studio Outbox) whenever a Studio project is saved,
+ * recording all user-imported assets (with their assigned `sceneId`, `sceneOrder`, and placement)
+ * and per-scene timeline arrangements (`visualDurationSeconds`, `selectedRelativePath`, `fitMode`,
+ * `kenBurns`, `playbackRate`, and sub-clip `segments[]`) so SpliceWright Studio can sync editor changes.
+ */
+export function writeStudioUpdatesManifest(
+  projectRoot: string,
+  project: VideoProjectManifest
+): void {
+  if (!fs.existsSync(path.join(projectRoot, 'ai-movie.json'))) {
+    return;
+  }
+  const exportsDir = path.join(projectRoot, 'exports');
+  fs.mkdirSync(exportsDir, { recursive: true });
+  const updatesPath = path.join(exportsDir, 'studio-updates.json');
+
+  let existingAddedMap = new Map<string, StudioUpdateAddedAssetEntry>();
+  if (fs.existsSync(updatesPath)) {
+    try {
+      const prev = JSON.parse(fs.readFileSync(updatesPath, 'utf-8')) as StudioUpdatesManifest;
+      for (const item of prev.addedAssets || []) {
+        existingAddedMap.set(item.id, item);
+      }
+    } catch {}
+  }
+
+  const assetMap = new Map<string, ProjectMediaAsset>(project.assets.map((a) => [a.id, a]));
+  const allClips: TimelineClip[] = project.timeline.tracks.flatMap((t) => t.clips);
+
+  const addedAssets: StudioUpdateAddedAssetEntry[] = [];
+  for (const asset of project.assets) {
+    if (asset.source !== 'user-imported') continue;
+    const matchingClip = allClips.find((c) => c.assetId === asset.id);
+    const existingEntry = existingAddedMap.get(asset.id);
+    const effectiveSceneId = asset.sceneId || matchingClip?.sceneId || existingEntry?.sceneId;
+    const effectiveSceneOrder = matchingClip?.sceneOrder || existingEntry?.sceneOrder;
+
+    addedAssets.push({
+      id: asset.id,
+      kind: asset.kind,
+      label: asset.label,
+      relativePath: asset.originalRelativePath || asset.relativePath,
+      durationSeconds: asset.durationSeconds,
+      sceneId: effectiveSceneId,
+      sceneOrder: effectiveSceneOrder,
+      assignment:
+        existingEntry?.assignment ||
+        (effectiveSceneId ? 'assigned-scene' : 'shared-project'),
+      placedAtTimelineSeconds: matchingClip?.timelineStart ?? existingEntry?.placedAtTimelineSeconds,
+      sourceInSeconds: matchingClip?.sourceIn ?? existingEntry?.sourceInSeconds,
+      sourceOutSeconds: matchingClip?.sourceOut ?? existingEntry?.sourceOutSeconds,
+      playbackRate: matchingClip?.playbackRate ?? existingEntry?.playbackRate ?? 1.0,
+      muteSourceAudio: matchingClip?.muteSourceAudio ?? existingEntry?.muteSourceAudio,
+      fitMode: matchingClip?.fitMode ?? existingEntry?.fitMode,
+      kenBurns: matchingClip?.kenBurns ?? existingEntry?.kenBurns,
+      addedAt: existingEntry?.addedAt || new Date().toISOString(),
+    });
+  }
+
+  const sceneTimelineUpdates: StudioUpdateSceneTimelineEntry[] = [];
+  const vidTrack = project.timeline.tracks.find((t) => t.type === 'video');
+  if (vidTrack) {
+    const clipsByScene = new Map<string, TimelineClip[]>();
+    for (const c of vidTrack.clips) {
+      if (!c.sceneId) continue;
+      const arr = clipsByScene.get(c.sceneId) || [];
+      arr.push(c);
+      clipsByScene.set(c.sceneId, arr);
+    }
+
+    const sortedSceneEntries = Array.from(clipsByScene.entries()).sort(
+      (a, b) =>
+        (a[1][0]?.sceneOrder ?? 999) - (b[1][0]?.sceneOrder ?? 999) ||
+        (a[1][0]?.timelineStart ?? 0) - (b[1][0]?.timelineStart ?? 0)
+    );
+
+    sortedSceneEntries.forEach(([sceneId, clips], idx) => {
+      const sortedClips = [...clips].sort((a, b) => a.timelineStart - b.timelineStart);
+      const firstClip = sortedClips[0];
+      const primaryAsset = firstClip ? assetMap.get(firstClip.assetId) : undefined;
+      const seqItem = project.sequence.find((s) => s.id === sceneId);
+      const visualDurationSeconds =
+        Math.round(
+          sortedClips.reduce((sum, c) => sum + getClipTimelineDuration(c), 0) * 100
+        ) / 100;
+
+      sceneTimelineUpdates.push({
+        sceneId,
+        sceneOrder: firstClip?.sceneOrder ?? seqItem?.order ?? idx + 1,
+        title: seqItem?.title || firstClip?.label || sceneId,
+        timelineStartSeconds: firstClip?.timelineStart ?? 0,
+        visualDurationSeconds,
+        selectedAssetId: firstClip?.assetId,
+        selectedRelativePath: primaryAsset
+          ? primaryAsset.originalRelativePath || primaryAsset.relativePath
+          : null,
+        isCustomEditorSelection: primaryAsset?.source === 'user-imported',
+        fitMode: firstClip?.fitMode,
+        kenBurns: firstClip?.kenBurns,
+        playbackRate: firstClip?.playbackRate,
+        muteSourceAudio: firstClip?.muteSourceAudio,
+        segments: sortedClips.map((c) => ({
+          sourceInSeconds: c.sourceIn,
+          sourceOutSeconds: c.sourceOut,
+          playbackRate: c.playbackRate || 1.0,
+        })),
+      });
+    });
+  }
+
+  const manifest: StudioUpdatesManifest = {
+    schemaVersion: '1.0',
+    projectTitle: project.title,
+    updatedAt: new Date().toISOString(),
+    addedAssets,
+    sceneTimelineUpdates,
+  };
+
+  fs.writeFileSync(updatesPath, JSON.stringify(manifest, null, 2), 'utf-8');
 }
 
 /**
@@ -1229,6 +1531,247 @@ export function sanitizeProjectManifest(
   return modified;
 }
 
+/** Whether an asset's file exists, is outside `archive/`, and (for Studio posters) is a real image. */
+function isAssetFileUsable(projectRoot: string, asset: ProjectMediaAsset): boolean {
+  if (asset.isPlaceholderSlate || asset.relativePath.startsWith('__slate__/')) return true;
+  if (asset.kind === 'image' && asset.isPosterFallback && asset.source === 'ai-movie') {
+    return isUsablePosterFile(projectRoot, asset.relativePath);
+  }
+  return isUsableMediaFile(projectRoot, asset.relativePath);
+}
+
+/**
+ * Reconciles a saved timeline against the media actually on disk (Section 7.5 of
+ * `what-editor-app-needs-to-know.md`). Runs on every load and on every Studio sync:
+ *  - Scene clips pointing at missing / archived / undefined assets are re-resolved from `ai-movie.json`
+ *    (preferred take, else latest take, else poster, else slate) with `sourceIn`/`sourceOut` reset.
+ *  - Dialogue clips for missing media or for files not listed in `scene.audioAssets[]` are removed, and a repaired
+ *    scene with an empty dialogue track gets its eligible dialogue back.
+ *  - Clips that cannot be repaired are flagged `missingMedia` instead of rendering blank.
+ *  - Stale `availableTakeAssetIds`, `sequence[]` paths and posters are dropped.
+ * A still-valid saved selection is never overridden.
+ */
+export async function reconcileProjectMedia(
+  projectRoot: string,
+  project: VideoProjectManifest,
+  aiMovie: AiMovieManifest | null,
+  prebuiltFresh?: VideoProjectManifest
+): Promise<boolean> {
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const before = JSON.stringify({
+    assets: project.assets,
+    tracks: project.timeline.tracks,
+    markers: project.timeline.markers,
+    sequence: project.sequence,
+  });
+
+  const fresh = aiMovie ? prebuiltFresh ?? (await buildProjectFromAiMovie(projectRoot, aiMovie)) : null;
+  const activeSceneIds = aiMovie ? new Set<string>((aiMovie.scenes || []).map((s) => s.id)) : null;
+  const freshAssetIds = new Set<string>((fresh?.assets || []).map((a) => a.id));
+  const assetById = new Map<string, ProjectMediaAsset>(project.assets.map((a) => [a.id, a]));
+
+  // Loose files in `audio/<scene-id>/` that are not in `scene.audioAssets[]` are never timeline audio
+  const isUnlinkedSceneDialogue = (a: ProjectMediaAsset): boolean =>
+    Boolean(
+      fresh &&
+        activeSceneIds &&
+        a.source === 'ai-movie' &&
+        a.kind === 'dialogue' &&
+        a.sceneId &&
+        activeSceneIds.has(a.sceneId) &&
+        !freshAssetIds.has(a.id)
+    );
+  const isAssetValid = (assetId: string): boolean => {
+    const a = assetById.get(assetId);
+    return Boolean(a) && !isUnlinkedSceneDialogue(a!) && isAssetFileUsable(projectRoot, a!);
+  };
+
+  const videoTrack = project.timeline.tracks.find((t) => t.type === 'video');
+  const dialogueTrack = project.timeline.tracks.find((t) => t.type === 'dialogue');
+  const repairedSceneIds = new Set<string>();
+  const restoredDialogueSceneIds = new Set<string>();
+
+  // 1. Re-resolve scene video clips whose media is gone (rules 1-3)
+  if (videoTrack && fresh) {
+    const freshVideoTrack = fresh.timeline.tracks.find((t) => t.type === 'video');
+    const freshClipsByScene = new Map<string, TimelineClip[]>();
+    for (const c of freshVideoTrack?.clips || []) {
+      if (!c.sceneId) continue;
+      const list = freshClipsByScene.get(c.sceneId) || [];
+      list.push(c);
+      freshClipsByScene.set(c.sceneId, list);
+    }
+
+    const sceneStartOf = (sceneId: string): number =>
+      Math.min(
+        ...videoTrack.clips.filter((c) => c.sceneId === sceneId).map((c) => c.timelineStart)
+      );
+    const brokenSceneIds = Array.from(
+      new Set(
+        videoTrack.clips
+          .filter((c) => c.sceneId && !isAssetValid(c.assetId) && freshClipsByScene.has(c.sceneId))
+          .map((c) => c.sceneId as string)
+      )
+    ).sort((a, b) => sceneStartOf(a) - sceneStartOf(b));
+
+    for (const sceneId of brokenSceneIds) {
+      const oldClips = videoTrack.clips.filter((c) => c.sceneId === sceneId);
+      const oldStart = Math.min(...oldClips.map((c) => c.timelineStart));
+      const oldEnd = Math.max(...oldClips.map((c) => c.timelineStart + getClipTimelineDuration(c)));
+      const freshClips = [...(freshClipsByScene.get(sceneId) || [])].sort(
+        (a, b) => a.timelineStart - b.timelineStart
+      );
+
+      for (const fa of fresh.assets) {
+        if (
+          fa.sceneId === sceneId &&
+          (fa.kind === 'video' || fa.kind === 'image') &&
+          !assetById.has(fa.id)
+        ) {
+          project.assets.push(fa);
+          assetById.set(fa.id, fa);
+        }
+      }
+
+      const firstFreshStart = freshClips[0].timelineStart;
+      const replacement: TimelineClip[] = freshClips.map((fc) => ({
+        ...fc,
+        timelineStart: round2(oldStart + fc.timelineStart - firstFreshStart),
+        availableTakeAssetIds: (fc.availableTakeAssetIds || []).filter((id) => assetById.has(id)),
+      }));
+      const newEnd = Math.max(
+        ...replacement.map((c) => c.timelineStart + getClipTimelineDuration(c))
+      );
+
+      videoTrack.clips = videoTrack.clips.filter((c) => c.sceneId !== sceneId).concat(replacement);
+
+      // Ripple later scene content so a different take length leaves no overlap or gap
+      const delta = round2(newEnd - oldEnd);
+      if (Math.abs(delta) >= 0.01) {
+        for (const track of project.timeline.tracks) {
+          for (const c of track.clips) {
+            if (c.sceneId !== sceneId && c.timelineStart >= oldEnd - 0.01) {
+              c.timelineStart = round2(c.timelineStart + delta);
+            }
+          }
+        }
+        for (const m of project.timeline.markers) {
+          if (m.sceneId !== sceneId && m.time >= oldEnd - 0.01) {
+            m.time = round2(m.time + delta);
+          }
+        }
+      }
+      repairedSceneIds.add(sceneId);
+    }
+    videoTrack.clips.sort((a, b) => a.timelineStart - b.timelineStart);
+  }
+
+  // 2. Dialogue: drop clips with missing media / unlinked files, and restore eligible dialogue for repaired scenes (rules 5-6)
+  if (dialogueTrack) {
+    dialogueTrack.clips = dialogueTrack.clips.filter((c) => {
+      if (isAssetValid(c.assetId)) return true;
+      const a = assetById.get(c.assetId);
+      return Boolean(a) && a!.source === 'user-imported' && !isUnlinkedSceneDialogue(a!);
+    });
+
+    if (fresh && videoTrack) {
+      const freshDialogueTrack = fresh.timeline.tracks.find((t) => t.type === 'dialogue');
+      const freshVideoTrack = fresh.timeline.tracks.find((t) => t.type === 'video');
+      for (const sceneId of repairedSceneIds) {
+        if (dialogueTrack.clips.some((c) => c.sceneId === sceneId)) continue;
+        const freshDlgClips = (freshDialogueTrack?.clips || []).filter((c) => c.sceneId === sceneId);
+        if (freshDlgClips.length === 0) continue;
+        const freshSceneStart = Math.min(
+          ...(freshVideoTrack?.clips || [])
+            .filter((c) => c.sceneId === sceneId)
+            .map((c) => c.timelineStart)
+        );
+        const projSceneStart = Math.min(
+          ...videoTrack.clips.filter((c) => c.sceneId === sceneId).map((c) => c.timelineStart)
+        );
+        for (const fc of freshDlgClips) {
+          const fa = fresh.assets.find((a) => a.id === fc.assetId);
+          if (!fa) continue;
+          if (!assetById.has(fa.id)) {
+            project.assets.push(fa);
+            assetById.set(fa.id, fa);
+          }
+          dialogueTrack.clips.push({
+            ...fc,
+            timelineStart: round2(Math.max(0, projSceneStart + fc.timelineStart - freshSceneStart)),
+          });
+        }
+        restoredDialogueSceneIds.add(sceneId);
+      }
+    }
+    dialogueTrack.clips.sort((a, b) => a.timelineStart - b.timelineStart);
+  }
+
+  // 3. Drop stale take ids and flag clips whose media cannot be recovered
+  for (const track of project.timeline.tracks) {
+    if (track.type === 'text') continue;
+    for (const clip of track.clips) {
+      if (clip.availableTakeAssetIds) {
+        clip.availableTakeAssetIds = clip.availableTakeAssetIds.filter(
+          (id) => id === clip.assetId || isAssetValid(id)
+        );
+      }
+      if (isAssetValid(clip.assetId)) {
+        delete clip.missingMedia;
+      } else {
+        clip.missingMedia = true;
+      }
+    }
+  }
+
+  // 4. Register only media that exists
+  const referencedAssetIds = new Set<string>();
+  for (const track of project.timeline.tracks) {
+    for (const clip of track.clips) {
+      if (clip.missingMedia) referencedAssetIds.add(clip.assetId);
+    }
+  }
+  project.assets = project.assets.filter(
+    (a) =>
+      referencedAssetIds.has(a.id) ||
+      (!isUnlinkedSceneDialogue(a) && (a.source !== 'ai-movie' || isAssetFileUsable(projectRoot, a)))
+  );
+
+  // 5. Keep `sequence[]` consistent with the repaired timeline
+  const freshSeqById = new Map((fresh?.sequence || []).map((s) => [s.id, s]));
+  for (const seq of project.sequence) {
+    const fseq = freshSeqById.get(seq.id);
+    if (fseq && repairedSceneIds.has(seq.id)) {
+      seq.selectedVideo = fseq.selectedVideo;
+      seq.alternateVideos = fseq.alternateVideos;
+      seq.posterFrame = fseq.posterFrame;
+      if (restoredDialogueSceneIds.has(seq.id)) {
+        seq.dialogue = fseq.dialogue;
+      }
+    }
+    if (seq.selectedVideo && !isUsableMediaFile(projectRoot, seq.selectedVideo)) {
+      seq.selectedVideo = null;
+    }
+    seq.alternateVideos = (seq.alternateVideos || []).filter((v) =>
+      isUsableMediaFile(projectRoot, v.path)
+    );
+    if (seq.posterFrame && !isUsablePosterFile(projectRoot, seq.posterFrame)) {
+      seq.posterFrame = null;
+    }
+    seq.dialogue = (seq.dialogue || []).filter((d) => isUsableMediaFile(projectRoot, d.path));
+  }
+
+  return (
+    before !==
+    JSON.stringify({
+      assets: project.assets,
+      tracks: project.timeline.tracks,
+      markers: project.timeline.markers,
+      sequence: project.sequence,
+    })
+  );
+}
+
 /**
  * Check whether a scene in a freshly built `VideoProjectManifest` has any real media
  * (video take, poster image on disk, or audio clip) as opposed to only a blank placeholder slate.
@@ -1280,14 +1823,67 @@ export async function computeAiMovieSyncSummary(
   const existingAssetMap = new Map(currentProject.assets.map((a) => [a.id, a]));
   const existingSceneMap = new Map(currentProject.sequence.map((s) => [s.id, s]));
   const dismissedSet = new Set<string>(currentProject.dismissedSceneIds || []);
+  const appliedTextDefaults = new Set(currentProject.studioTextOverlayDefaultsApplied || []);
+  const newTextOverlaysCount = (freshFromAiMovie.studioTextOverlayDefaultsApplied || []).filter(
+    (sceneId) => !appliedTextDefaults.has(sceneId) &&
+      (!dismissedSet.has(sceneId) || sceneHasRealMedia(freshFromAiMovie, sceneId))
+  ).length;
+  const manifestUpdatedMs = currentProject.updatedAt
+    ? new Date(currentProject.updatedAt).getTime()
+    : 0;
 
   let newTakesCount = 0;
   let newDialogueCount = 0;
+  let modifiedMediaCount = 0;
+
   for (const asset of freshFromAiMovie.assets) {
     if (asset.isPlaceholderSlate) continue;
-    if (!existingAssetMap.has(asset.id)) {
+    const existing = existingAssetMap.get(asset.id);
+    if (!existing) {
       if (asset.kind === 'video' || asset.isPosterFallback) newTakesCount++;
       if (asset.kind === 'dialogue') newDialogueCount++;
+    } else {
+      const sourceRelPath = asset.originalRelativePath || asset.relativePath;
+      const fullPath = path.join(projectRoot, sourceRelPath);
+      let fileModifiedRecently = false;
+
+      if (existing.isNormalized && existing.originalRelativePath) {
+        // For normalized narration/SFX/music (`[Norm]`), compare raw file's mtime against the normalized `.mp3`'s mtime!
+        const normFullPath = path.join(projectRoot, existing.relativePath);
+        if (fs.existsSync(fullPath) && fs.existsSync(normFullPath)) {
+          try {
+            const rawStat = fs.statSync(fullPath);
+            const normStat = fs.statSync(normFullPath);
+            if (rawStat.mtimeMs > normStat.mtimeMs + 1000) {
+              fileModifiedRecently = true;
+            }
+          } catch {}
+        }
+      } else if (fs.existsSync(fullPath)) {
+        try {
+          const stat = fs.statSync(fullPath);
+          const baselineMs = Math.max(manifestUpdatedMs, existing.cacheVersion || 0);
+          if (baselineMs > 0 && stat.mtimeMs > baselineMs + 1000) {
+            fileModifiedRecently = true;
+          }
+        } catch {}
+      }
+
+      const durationChanged =
+        !asset.isPosterFallback &&
+        !existing.isNormalized &&
+        Math.abs((existing.durationSeconds || 0) - (asset.durationSeconds || 0)) >= 0.15;
+      const pathOrTextChanged =
+        (existing.originalRelativePath || existing.relativePath) !==
+          (asset.originalRelativePath || asset.relativePath) ||
+        (asset.kind === 'dialogue' &&
+          Boolean(asset.dialogueText) &&
+          Boolean(existing.dialogueText) &&
+          existing.dialogueText !== asset.dialogueText);
+
+      if (fileModifiedRecently || durationChanged || pathOrTextChanged) {
+        modifiedMediaCount++;
+      }
     }
   }
 
@@ -1342,12 +1938,16 @@ export async function computeAiMovieSyncSummary(
       newTakesCount > 0 ||
       newDialogueCount > 0 ||
       newScenesCount > 0 ||
-      durationChangesCount > 0,
+      durationChangesCount > 0 ||
+      modifiedMediaCount > 0 ||
+      newTextOverlaysCount > 0,
     aiMovieBusy: false,
     newTakesCount,
     newDialogueCount,
     newScenesCount,
     durationChangesCount,
+    modifiedMediaCount,
+    ...(newTextOverlaysCount > 0 ? { newTextOverlaysCount } : {}),
   };
 }
 
@@ -1379,19 +1979,55 @@ export async function mergeNewAssetsFromAiMovie(
   // Prune any scenes that were deleted in Studio (`ai-movie.json`)
   sanitizeProjectManifest(projectRoot, merged, aiMovie);
 
+  // Re-resolve dead/archived takes, drop unlinked audio and fix stale selections before merging new media
+  await reconcileProjectMedia(projectRoot, merged, aiMovie, fresh);
+
   const existingAssetsById = new Map(merged.assets.map((a) => [a.id, a]));
+  const nowVersion = Date.now();
   for (const asset of fresh.assets) {
     if (asset.sceneId && dismissedSet.has(asset.sceneId)) continue;
     const existing = existingAssetsById.get(asset.id);
     if (!existing) {
+      asset.cacheVersion = nowVersion;
       merged.assets.push(asset);
       existingAssetsById.set(asset.id, asset);
     } else {
+      const sourceRel = asset.originalRelativePath || asset.relativePath;
+      const fullPath = path.join(projectRoot, sourceRel);
+      let diskMtime = nowVersion;
+      if (fs.existsSync(fullPath)) {
+        try {
+          diskMtime = Math.round(fs.statSync(fullPath).mtimeMs);
+        } catch {}
+      }
+      let normMtime = existing.cacheVersion || 0;
+      if (existing.isNormalized && fs.existsSync(path.join(projectRoot, existing.relativePath))) {
+        try {
+          normMtime = Math.round(
+            fs.statSync(path.join(projectRoot, existing.relativePath)).mtimeMs
+          );
+        } catch {}
+      }
+      // If underlying raw file was regenerated/updated AFTER the normalized copy was created, revert to raw updated file until re-normalized
+      if (
+        existing.isNormalized &&
+        existing.originalRelativePath &&
+        normMtime > 0 &&
+        diskMtime > normMtime + 1000
+      ) {
+        existing.relativePath = asset.relativePath;
+        existing.originalRelativePath = undefined;
+        existing.isNormalized = false;
+      } else if (!existing.isNormalized) {
+        existing.relativePath = asset.relativePath;
+      }
       existing.durationSeconds = asset.durationSeconds;
-      existing.relativePath = asset.relativePath;
       existing.label = asset.label;
+      existing.dialogueText = asset.dialogueText ?? existing.dialogueText;
+      existing.speaker = asset.speaker ?? existing.speaker;
       existing.isPlaceholderSlate = asset.isPlaceholderSlate;
       existing.isPosterFallback = asset.isPosterFallback;
+      existing.cacheVersion = diskMtime;
     }
   }
 
@@ -1421,35 +2057,43 @@ export async function mergeNewAssetsFromAiMovie(
         (c) => c.sceneId && c.sceneId === freshClip.sceneId
       );
       if (existingClip) {
-        existingClip.availableTakeAssetIds = freshClip.availableTakeAssetIds;
+        const mergedTakes = new Set<string>(freshClip.availableTakeAssetIds || []);
+        for (const oldTakeId of existingClip.availableTakeAssetIds || []) {
+          if (existingAssetsById.has(oldTakeId)) mergedTakes.add(oldTakeId);
+        }
+        mergedTakes.add(existingClip.assetId);
+        existingClip.availableTakeAssetIds = Array.from(mergedTakes);
+
         const currentAsset = existingAssetsById.get(existingClip.assetId);
         const freshAsset = existingAssetsById.get(freshClip.assetId);
 
-        // Upgrade from Placeholder Slate -> Poster or Video, or from Poster -> Video
-        if (
-          currentAsset?.isPlaceholderSlate &&
-          freshAsset &&
-          !freshAsset.isPlaceholderSlate
-        ) {
-          existingClip.assetId = freshAsset.id;
-          existingClip.label = freshClip.label;
-          existingClip.sourceIn = 0;
-          existingClip.sourceOut = freshClip.sourceOut;
-          existingClip.kenBurns = freshClip.kenBurns;
-        } else if (
-          currentAsset?.isPosterFallback &&
-          freshAsset &&
-          !freshAsset.isPosterFallback
-        ) {
-          existingClip.assetId = freshAsset.id;
-          existingClip.label = freshClip.label;
-          existingClip.sourceIn = 0;
-          existingClip.sourceOut = freshAsset.durationSeconds;
-          existingClip.kenBurns = 'none';
-        } else if (currentAsset?.isPosterFallback) {
-          // Update poster/slate duration to match updated Studio scene duration / dialogue span
-          existingClip.sourceIn = 0;
-          existingClip.sourceOut = freshClip.sourceOut;
+        // Protect user-imported custom selections: only auto-upgrade if currentAsset is an ai-movie placeholder slate or poster fallback
+        if (currentAsset?.source !== 'user-imported') {
+          if (
+            currentAsset?.isPlaceholderSlate &&
+            freshAsset &&
+            !freshAsset.isPlaceholderSlate
+          ) {
+            existingClip.assetId = freshAsset.id;
+            existingClip.label = freshClip.label;
+            existingClip.sourceIn = 0;
+            existingClip.sourceOut = freshClip.sourceOut;
+            existingClip.kenBurns = freshClip.kenBurns;
+          } else if (
+            currentAsset?.isPosterFallback &&
+            freshAsset &&
+            !freshAsset.isPosterFallback
+          ) {
+            existingClip.assetId = freshAsset.id;
+            existingClip.label = freshClip.label;
+            existingClip.sourceIn = 0;
+            existingClip.sourceOut = freshAsset.durationSeconds;
+            existingClip.kenBurns = 'none';
+          } else if (currentAsset?.isPosterFallback) {
+            // Update poster/slate duration to match updated Studio scene duration / dialogue span
+            existingClip.sourceIn = 0;
+            existingClip.sourceOut = freshClip.sourceOut;
+          }
         }
       } else {
         mergedVideoTrack.clips.push({ ...freshClip });
@@ -1515,19 +2159,36 @@ export async function mergeNewAssetsFromAiMovie(
     ...merged.timeline.markers.filter((m) => m.kind === 'user'),
   ];
 
-  for (const seq of activeSequence) {
+  for (let sIdx = 0; sIdx < activeSequence.length; sIdx++) {
+    const seq = activeSequence[sIdx];
     const sceneId = seq.id;
     const sceneOrder = seq.order;
     const sceneStart = Math.round(rippleCursor * 100) / 100;
 
-    // 1. Position scene's video/poster/slate clip at sceneStart
+    // Check whether the next scene in `activeSequence` is a silent continuation scene (no dialogue of its own)
+    const nextSeq = activeSequence[sIdx + 1];
+    const nextSceneHasDialogue = Boolean(
+      nextSeq &&
+        ((nextSeq.dialogue && nextSeq.dialogue.length > 0) ||
+          mergedDlgTrack?.clips.some((c) => c.sceneId === nextSeq.id))
+    );
+    const nextSceneIsSilentContinuation = Boolean(nextSeq && !nextSceneHasDialogue);
+
+    // 1. Position all of this scene's video/poster/slate sub-clips sequentially starting at sceneStart
     let videoSpan = seq.targetDurationSeconds || 5;
     if (mergedVideoTrack) {
-      const vidClip = mergedVideoTrack.clips.find((c) => c.sceneId === sceneId);
-      if (vidClip) {
-        vidClip.timelineStart = sceneStart;
-        vidClip.sceneOrder = sceneOrder;
-        videoSpan = Math.max(0.2, vidClip.sourceOut - vidClip.sourceIn);
+      const sceneVidClips = mergedVideoTrack.clips
+        .filter((c) => c.sceneId === sceneId)
+        .sort((a, b) => a.timelineStart - b.timelineStart);
+      if (sceneVidClips.length > 0) {
+        let subCursor = sceneStart;
+        for (const vClip of sceneVidClips) {
+          vClip.timelineStart = Math.round(subCursor * 100) / 100;
+          vClip.sceneOrder = sceneOrder;
+          const vDur = getClipTimelineDuration(vClip);
+          subCursor = Math.round((subCursor + vDur) * 100) / 100;
+        }
+        videoSpan = Math.max(0.2, Math.round((subCursor - sceneStart) * 100) / 100);
       }
     }
 
@@ -1537,20 +2198,32 @@ export async function mergeNewAssetsFromAiMovie(
       const sceneDlgClips = mergedDlgTrack.clips.filter((c) => c.sceneId === sceneId);
       for (const dClip of sceneDlgClips) {
         dClip.timelineStart = Math.round((sceneStart + dlgOffset) * 100) / 100;
-        const dDur = Math.max(0.2, dClip.sourceOut - dClip.sourceIn);
+        const dDur = getClipTimelineDuration(dClip);
         dlgOffset += dDur + DIALOGUE_PAUSE_SECONDS;
       }
     }
     const totalDlgSpan =
       dlgOffset > 0 ? Math.max(0, dlgOffset - DIALOGUE_PAUSE_SECONDS) : 0;
 
-    // If the scene clip is a poster or slate and dialogue is longer than videoSpan, extend it
-    if (mergedVideoTrack) {
-      const vidClip = mergedVideoTrack.clips.find((c) => c.sceneId === sceneId);
-      const vidAsset = vidClip ? existingAssetsById.get(vidClip.assetId) : undefined;
-      if (vidClip && vidAsset?.isPosterFallback && totalDlgSpan > videoSpan) {
-        videoSpan = Math.ceil(totalDlgSpan);
-        vidClip.sourceOut = videoSpan;
+    // Compute how much earlier spanning audio from an Anchor Scene is still playing when this scene starts
+    const dialogueTrackEndSoFar = (mergedDlgTrack?.clips || []).reduce(
+      (maxEnd, c) =>
+        c.timelineStart <= sceneStart + totalDlgSpan + 0.05
+          ? Math.max(maxEnd, c.timelineStart + getClipTimelineDuration(c))
+          : maxEnd,
+      0
+    );
+    const remainingSpanningAudio = Math.max(totalDlgSpan, dialogueTrackEndSoFar - sceneStart);
+
+    // Under Scenario 2: only extend the poster/slate if this is the LAST scene in the audio span (`!nextSceneIsSilentContinuation`)
+    if (!nextSceneIsSilentContinuation && mergedVideoTrack) {
+      const sceneVidClips = mergedVideoTrack.clips.filter((c) => c.sceneId === sceneId);
+      const lastVidClip = sceneVidClips[sceneVidClips.length - 1];
+      const vidAsset = lastVidClip ? existingAssetsById.get(lastVidClip.assetId) : undefined;
+      if (lastVidClip && vidAsset?.isPosterFallback && remainingSpanningAudio > videoSpan) {
+        const extraNeeded = Math.ceil(remainingSpanningAudio - videoSpan);
+        lastVidClip.sourceOut = Math.round((lastVidClip.sourceOut + extraNeeded) * 100) / 100;
+        videoSpan = Math.round((videoSpan + extraNeeded) * 100) / 100;
       }
     }
 
@@ -1568,7 +2241,10 @@ export async function mergeNewAssetsFromAiMovie(
       });
     }
 
-    rippleCursor = Math.round((sceneStart + Math.max(videoSpan, totalDlgSpan)) * 100) / 100;
+    const nextAdvance = nextSceneIsSilentContinuation
+      ? videoSpan
+      : Math.max(videoSpan, remainingSpanningAudio);
+    rippleCursor = Math.round((sceneStart + nextAdvance) * 100) / 100;
   }
 
   if (mergedVideoTrack) {
@@ -1580,6 +2256,7 @@ export async function mergeNewAssetsFromAiMovie(
 
   merged.timeline.markers = updatedMarkers;
   merged.sequence = activeSequence;
+  applyStudioTextOverlayDefaults(merged, aiMovie);
   saveVideoProjectManifest(projectRoot, merged);
   return merged;
 }
@@ -1609,6 +2286,15 @@ export async function rebuildProjectFromAiMovie(
       }
     }
 
+    // Text defaults become editor-owned after import, even when their clips are deleted.
+    fresh.timeline.tracks = fresh.timeline.tracks.filter((track) => track.type !== 'text');
+    fresh.timeline.tracks.push(...currentProject.timeline.tracks
+      .filter((track) => track.type === 'text').map((track) => structuredClone(track)));
+    delete fresh.studioTextOverlayDefaultsApplied;
+    if (currentProject.studioTextOverlayDefaultsApplied) {
+      fresh.studioTextOverlayDefaultsApplied = [...currentProject.studioTextOverlayDefaultsApplied];
+    }
+    applyStudioTextOverlayDefaults(fresh, aiMovie);
     // Preserve user-placed Music and SFX clips that aren't tied to an AI Movie scene
     for (const trackType of ['music', 'sfx'] as const) {
       const oldTrack = currentProject.timeline.tracks.find((t) => t.type === trackType);
@@ -1629,6 +2315,482 @@ export async function rebuildProjectFromAiMovie(
   return fresh;
 }
 
+/**
+ * Refreshes ONLY a single selected clip (and its underlying asset) from disk & `ai-movie.json`
+ * without touching or ripple-resetting the rest of the timeline.
+ */
+export async function refreshSingleClipInProject(
+  projectRoot: string,
+  currentProject: VideoProjectManifest,
+  clipId: string
+): Promise<{ project: VideoProjectManifest; refreshedLabel: string; newDurationSeconds: number }> {
+  const updated: VideoProjectManifest = JSON.parse(JSON.stringify(currentProject));
+  let targetClip: TimelineClip | null = null;
+  let targetTrack: TimelineTrack | null = null;
+
+  for (const track of updated.timeline.tracks) {
+    const found = track.clips.find((c) => c.id === clipId);
+    if (found) {
+      targetClip = found;
+      targetTrack = track;
+      break;
+    }
+  }
+
+  if (!targetClip || !targetTrack) {
+    return { project: currentProject, refreshedLabel: 'Clip', newDurationSeconds: 0 };
+  }
+
+  const aiMovie = readAiMovieReadOnly(projectRoot);
+  const freshFromAiMovie = aiMovie ? await buildProjectFromAiMovie(projectRoot, aiMovie) : null;
+  const nowVersion = Date.now();
+
+  let asset = updated.assets.find((a) => a.id === targetClip!.assetId) || null;
+
+  // If this clip belongs to an AI Movie scene, check if `ai-movie.json` has an updated asset or newly generated take/poster/dialogue for it
+  if (freshFromAiMovie) {
+    let freshAsset = freshFromAiMovie.assets.find((a) => a.id === targetClip!.assetId);
+
+    // If the clip was a placeholder slate or poster and Studio now has a poster/video for this scene, or if a dialogue line got a new audio ID
+    if (targetClip.sceneId) {
+      if (targetTrack.type === 'video') {
+        const freshVidTrack = freshFromAiMovie.timeline.tracks.find((t) => t.type === 'video');
+        const freshSceneClip = freshVidTrack?.clips.find((c) => c.sceneId === targetClip!.sceneId);
+        if (freshSceneClip) {
+          targetClip.availableTakeAssetIds = freshSceneClip.availableTakeAssetIds;
+          // Ensure all available take assets for this scene exist in `updated.assets`
+          for (const takeAssetId of freshSceneClip.availableTakeAssetIds || []) {
+            const fTake = freshFromAiMovie.assets.find((a) => a.id === takeAssetId);
+            if (fTake && !updated.assets.some((a) => a.id === takeAssetId)) {
+              updated.assets.push({ ...fTake, cacheVersion: nowVersion });
+            }
+          }
+          // If current asset was a placeholder slate (or missing) and Studio now has a real poster/video, upgrade this clip
+          if (!freshAsset || asset?.isPlaceholderSlate) {
+            const candidate = freshFromAiMovie.assets.find((a) => a.id === freshSceneClip.assetId);
+            if (candidate && !candidate.isPlaceholderSlate) {
+              freshAsset = candidate;
+              if (!updated.assets.some((a) => a.id === candidate.id)) {
+                updated.assets.push(candidate);
+              }
+              targetClip.assetId = candidate.id;
+              asset = updated.assets.find((a) => a.id === candidate.id) || null;
+            }
+          }
+        }
+      } else if (targetTrack.type === 'dialogue' && !freshAsset) {
+        // Check if the scene's dialogue clip was regenerated under a new audio ID in Studio
+        const freshDlgTrack = freshFromAiMovie.timeline.tracks.find((t) => t.type === 'dialogue');
+        const sceneFreshDlgs =
+          freshDlgTrack?.clips.filter((c) => c.sceneId === targetClip!.sceneId) || [];
+        const sceneExistingDlgs = targetTrack.clips.filter((c) => c.sceneId === targetClip!.sceneId);
+        const clipIdxInScene = sceneExistingDlgs.findIndex((c) => c.id === targetClip!.id);
+        const replacementClip =
+          sceneFreshDlgs[clipIdxInScene] || sceneFreshDlgs[sceneFreshDlgs.length - 1];
+        if (replacementClip) {
+          const candidate = freshFromAiMovie.assets.find((a) => a.id === replacementClip.assetId);
+          if (candidate) {
+            freshAsset = candidate;
+            if (!updated.assets.some((a) => a.id === candidate.id)) {
+              updated.assets.push(candidate);
+            }
+            targetClip.assetId = candidate.id;
+            asset = updated.assets.find((a) => a.id === candidate.id) || null;
+          }
+        }
+      }
+    }
+
+    if (asset && freshAsset) {
+      asset.relativePath = freshAsset.relativePath;
+      asset.originalRelativePath = undefined;
+      asset.isNormalized = false;
+      asset.label = freshAsset.label;
+      asset.dialogueText = freshAsset.dialogueText ?? asset.dialogueText;
+      asset.speaker = freshAsset.speaker ?? asset.speaker;
+      asset.isPlaceholderSlate = freshAsset.isPlaceholderSlate;
+      asset.isPosterFallback = freshAsset.isPosterFallback;
+    }
+  }
+
+  if (!asset) {
+    return { project: currentProject, refreshedLabel: targetClip.label, newDurationSeconds: 0 };
+  }
+
+  // Re-probe the file on disk (falling back to originalRelativePath if normalized copy was stale)
+  const rawRelPath = asset.originalRelativePath || asset.relativePath;
+  const fullPath = path.join(projectRoot, rawRelPath);
+  if (asset.isNormalized && asset.originalRelativePath && fs.existsSync(fullPath)) {
+    asset.relativePath = asset.originalRelativePath;
+    asset.originalRelativePath = undefined;
+    asset.isNormalized = false;
+  }
+
+  let newDur = asset.durationSeconds;
+  if (fs.existsSync(fullPath) && asset.kind !== 'image' && !asset.isPosterFallback) {
+    const probed = await probeMediaDuration(fullPath);
+    if (probed && probed > 0) {
+      newDur = Math.round(probed * 100) / 100;
+      asset.durationSeconds = newDur;
+    }
+  }
+
+  asset.cacheVersion = nowVersion;
+  targetClip.label = asset.label;
+
+  // If it's an audio/video clip (not a still image hold), update sourceOut to reflect the refreshed file's duration
+  if (asset.kind !== 'image' && !asset.isPosterFallback && newDur > 0) {
+    targetClip.sourceIn = 0;
+    targetClip.sourceOut = newDur;
+  }
+
+  // Invalidate any pre-mixed audio cache if an audio clip was refreshed
+  if (targetTrack.type !== 'video') {
+    updated.preMixedAudioSignature = undefined;
+  }
+
+  saveVideoProjectManifest(projectRoot, updated);
+  return {
+    project: updated,
+    refreshedLabel: targetClip.label,
+    newDurationSeconds: Math.round((targetClip.sourceOut - targetClip.sourceIn) * 100) / 100,
+  };
+}
+
+/**
+ * Promotes a Standalone Folder project (`projectMode === 'standalone'`) into a full
+ * **SpliceWright Studio** project by creating `ai-movie.json` — strictly ONLY when `ai-movie.json`
+ * does not already exist on disk (preserving the Read-Only guarantee for existing Studio files).
+ *
+ * Maps timeline video clips (including OBS chapter sub-clips and speed-ramped segments) into
+ * `AiMovieScene` entries (`scene-1`, `scene-2`, ...), extracts `scenes/scene-N/first-frame.png`
+ * thumbnails via FFmpeg, and links timeline dialogue/SFX/music clips so the folder opens
+ * immediately in SpliceWright Studio.
+ */
+export async function convertStandaloneToStudioProject(
+  projectRoot: string,
+  currentProject: VideoProjectManifest
+): Promise<LoadedProjectBundle> {
+  const aiMoviePath = path.join(projectRoot, 'ai-movie.json');
+  if (fs.existsSync(aiMoviePath)) {
+    throw new Error(
+      'ai-movie.json already exists in this folder and is strictly Read-Only. Use "Sync Studio" instead.'
+    );
+  }
+
+  const updated: VideoProjectManifest = JSON.parse(JSON.stringify(currentProject));
+  const assetMap = new Map<string, ProjectMediaAsset>(updated.assets.map((a) => [a.id, a]));
+  const videoTrack = updated.timeline.tracks.find((t) => t.type === 'video');
+  const dialogueTrack = updated.timeline.tracks.find((t) => t.type === 'dialogue');
+  const sfxTrack = updated.timeline.tracks.find((t) => t.type === 'sfx');
+
+  const sortedVidClips = videoTrack
+    ? [...videoTrack.clips].sort((a, b) => a.timelineStart - b.timelineStart)
+    : [];
+
+  // Group consecutive clips that already share a `sceneId` (e.g., from Split Clip at Playhead) into one scene,
+  // while giving each independent clip or OBS chapter sub-clip its own `scene-N`.
+  interface SceneClipGroup {
+    sceneId: string;
+    order: number;
+    clips: TimelineClip[];
+  }
+
+  const groups: SceneClipGroup[] = [];
+  for (const clip of sortedVidClips) {
+    const prevGroup = groups[groups.length - 1];
+    if (prevGroup && clip.sceneId && prevGroup.sceneId === clip.sceneId) {
+      prevGroup.clips.push(clip);
+    } else {
+      const order = groups.length + 1;
+      const sceneId = `scene-${order}`;
+      groups.push({
+        sceneId,
+        order,
+        clips: [clip],
+      });
+    }
+  }
+
+  // Fallback if the user hasn't placed any video clips yet
+  if (groups.length === 0) {
+    groups.push({
+      sceneId: 'scene-1',
+      order: 1,
+      clips: [],
+    });
+  }
+
+  const scenes: AiMovieScene[] = [];
+  const updatedMarkers: TimelineMarker[] = [
+    ...updated.timeline.markers.filter((m) => m.kind === 'user'),
+  ];
+  const updatedSequence: VideoProjectSequenceItem[] = [];
+  const nowTs = Date.now();
+
+  for (let gIdx = 0; gIdx < groups.length; gIdx++) {
+    const grp = groups[gIdx];
+    const nextGrp = groups[gIdx + 1];
+    const { sceneId, order, clips } = grp;
+
+    const sceneDir = path.join(projectRoot, 'scenes', sceneId);
+    const sceneVideosDir = path.join(sceneDir, 'videos');
+    const sceneAudioDir = path.join(projectRoot, 'audio', sceneId);
+    fs.mkdirSync(sceneVideosDir, { recursive: true });
+    fs.mkdirSync(sceneAudioDir, { recursive: true });
+
+    const primaryClip = clips[0] || null;
+    const primaryAsset = primaryClip ? assetMap.get(primaryClip.assetId) || null : null;
+
+    const rawLabel = primaryClip?.label || `Scene ${order}`;
+    const cleanTitle =
+      rawLabel
+        .replace(/^\[(?:VIDEO|IMAGE|SHARED)[^\]]*\]\s*/i, '')
+        .replace(/\s*\(\[.*?\)\s*$/, '')
+        .replace(/\.(mp4|mkv|mov|webm|png|jpg|jpeg|webp)$/i, '')
+        .trim() || `Scene ${order}`;
+
+    const sceneStart = primaryClip ? primaryClip.timelineStart : 0;
+    const sceneVisualDuration =
+      clips.length > 0
+        ? Math.max(
+            1,
+            Math.round(
+              clips.reduce((sum, c) => sum + getClipTimelineDuration(c), 0) * 100
+            ) / 100
+          )
+        : 5;
+    const sceneWindowEnd = nextGrp?.clips[0]
+      ? nextGrp.clips[0].timelineStart
+      : sceneStart + sceneVisualDuration + 300;
+
+    for (const c of clips) {
+      c.sceneId = sceneId;
+      c.sceneOrder = order;
+    }
+
+    // 1. Create or extract `scenes/scene-N/first-frame.png`
+    let firstFrameFileName: string | undefined;
+    let posterRelPath: string | null = null;
+    if (primaryAsset && !primaryAsset.isPlaceholderSlate) {
+      const srcFull = path.join(projectRoot, primaryAsset.relativePath);
+      if (fs.existsSync(srcFull)) {
+        if (primaryAsset.kind === 'image') {
+          const ext = path.extname(srcFull).toLowerCase() || '.png';
+          firstFrameFileName = `first-frame${ext}`;
+          const destPosterFull = path.join(sceneDir, firstFrameFileName);
+          if (path.resolve(srcFull) !== path.resolve(destPosterFull)) {
+            fs.copyFileSync(srcFull, destPosterFull);
+          }
+          posterRelPath = normalizeRelPath(`scenes/${sceneId}/${firstFrameFileName}`);
+        } else if (primaryAsset.kind === 'video') {
+          firstFrameFileName = 'first-frame.png';
+          const destPosterFull = path.join(sceneDir, firstFrameFileName);
+          const ok = await extractVideoFrameToPng(
+            srcFull,
+            primaryClip?.sourceIn || 0,
+            destPosterFull
+          );
+          if (ok) {
+            posterRelPath = normalizeRelPath(`scenes/${sceneId}/${firstFrameFileName}`);
+          }
+        }
+      }
+    }
+
+    if (posterRelPath) {
+      const posterAssetId = `asset_${sceneId}_poster`;
+      if (!updated.assets.some((a) => a.id === posterAssetId)) {
+        updated.assets.push({
+          id: posterAssetId,
+          kind: 'image',
+          label: `[${cleanTitle}] First Frame Poster`,
+          relativePath: posterRelPath,
+          durationSeconds: sceneVisualDuration,
+          sceneId,
+          source: 'ai-movie',
+          isPosterFallback: true,
+        });
+      }
+    }
+
+    // 2. Build `scene.videos[]` entry (supporting Scenario 1 shared master video + `segments[]`)
+    const sceneVideos: AiMovieVideoTake[] = [];
+    let selectedVideoId: string | undefined;
+
+    if (primaryClip && primaryAsset && primaryAsset.kind === 'video') {
+      const takeId = `video-${nowTs}-${order}`;
+      selectedVideoId = takeId;
+      const firstSeg = clips[0];
+      const lastSeg = clips[clips.length - 1];
+      const takeEntry: AiMovieVideoTake = {
+        id: takeId,
+        label: cleanTitle,
+        fileName: primaryAsset.relativePath,
+        source: 'SpliceWright / OBS Recording',
+        providerModel: 'external',
+        durationSeconds: sceneVisualDuration,
+        aspectRatio: updated.format.aspectRatio,
+        resolution: `${updated.format.width}x${updated.format.height}`,
+        sourceInSeconds: firstSeg.sourceIn,
+        sourceOutSeconds: lastSeg.sourceOut,
+        playbackRate: firstSeg.playbackRate || 1.0,
+        muteSourceAudio: firstSeg.muteSourceAudio ?? false,
+        segments:
+          clips.length > 1
+            ? clips.map((c) => ({
+                sourceInSeconds: c.sourceIn,
+                sourceOutSeconds: c.sourceOut,
+                playbackRate: c.playbackRate || 1.0,
+              }))
+            : undefined,
+      };
+      sceneVideos.push(takeEntry);
+    }
+
+    // 3. Collect any Dialogue or SFX clips falling inside `[sceneStart, sceneWindowEnd)`
+    const sceneAudioAssets: AiMovieAudioAsset[] = [];
+    const dialogueLines: string[] = [];
+
+    if (dialogueTrack) {
+      const matchingDlgs = dialogueTrack.clips.filter(
+        (d) => d.timelineStart >= sceneStart - 0.1 && d.timelineStart < sceneWindowEnd - 0.05
+      );
+      matchingDlgs.forEach((dClip, dIdx) => {
+        dClip.sceneId = sceneId;
+        const dAsset = assetMap.get(dClip.assetId);
+        if (!dAsset) return;
+        dAsset.sceneId = sceneId;
+        const lineText = dAsset.dialogueText || dClip.label;
+        dialogueLines.push(lineText);
+        sceneAudioAssets.push({
+          id: `audio-${nowTs}-${order}-${dIdx + 1}`,
+          kind: 'dialogue',
+          fileName: dAsset.originalRelativePath || dAsset.relativePath,
+          dialogueLine: lineText,
+          characterId: 'char-narrator',
+          durationSeconds: getClipTimelineDuration(dClip),
+          status: 'approved',
+        });
+      });
+    }
+
+    if (sfxTrack) {
+      const matchingSfx = sfxTrack.clips.filter(
+        (s) => s.timelineStart >= sceneStart - 0.1 && s.timelineStart < sceneWindowEnd - 0.05
+      );
+      matchingSfx.forEach((sClip, sIdx) => {
+        sClip.sceneId = sceneId;
+        const sAsset = assetMap.get(sClip.assetId);
+        if (!sAsset) return;
+        sAsset.sceneId = sceneId;
+        sceneAudioAssets.push({
+          id: `sfx-${nowTs}-${order}-${sIdx + 1}`,
+          kind: 'sound-effect',
+          fileName: sAsset.originalRelativePath || sAsset.relativePath,
+          durationSeconds: getClipTimelineDuration(sClip),
+          startTimeSeconds: Math.max(0, Math.round((sClip.timelineStart - sceneStart) * 100) / 100),
+          status: 'approved',
+        });
+      });
+    }
+
+    scenes.push({
+      id: sceneId,
+      title: cleanTitle,
+      order,
+      sceneOrder: order,
+      status: sceneVideos.length > 0 ? 'ready' : 'planned',
+      summary: cleanTitle,
+      dialogue: dialogueLines.join('\n'),
+      durationSeconds: sceneVisualDuration,
+      aspectRatio: updated.format.aspectRatio,
+      resolution: `${updated.format.width}x${updated.format.height}`,
+      characterIds: ['char-narrator'],
+      audioAssets: sceneAudioAssets,
+      videos: sceneVideos,
+      properties: {
+        firstFrameFileName,
+        selectedVideoId,
+        order,
+        sceneOrder: order,
+      },
+    });
+
+    updatedMarkers.push({
+      id: `marker_scene_${sceneId}`,
+      time: Math.round(sceneStart * 100) / 100,
+      label: `Scene ${order}: ${cleanTitle}`,
+      kind: 'scene',
+      sceneId,
+      sceneOrder: order,
+      details: cleanTitle,
+    });
+
+    updatedSequence.push({
+      id: sceneId,
+      order,
+      title: cleanTitle,
+      targetDurationSeconds: sceneVisualDuration,
+      aspectRatio: updated.format.aspectRatio,
+      resolution: `${updated.format.width}x${updated.format.height}`,
+      posterFrame: posterRelPath,
+      selectedVideo:
+        primaryAsset && primaryAsset.kind === 'video' ? primaryAsset.relativePath : null,
+      alternateVideos: [],
+      dialogue: [],
+      soundEffects: [],
+      music: [],
+    });
+  }
+
+  const aiMovieManifest: AiMovieManifest = {
+    schemaVersion: 1,
+    projectVersion: 1,
+    title: updated.title || path.basename(projectRoot),
+    createdAt: new Date().toISOString(),
+    options: {
+      aspectRatio: updated.format.aspectRatio,
+      colorGrade: updated.lookPreset && updated.lookPreset !== 'none' ? updated.lookPreset : undefined,
+    },
+    characters: [
+      {
+        id: 'char-narrator',
+        name: 'Narrator',
+      },
+    ],
+    scenes,
+    storyboards: [],
+    editorState: {
+      hasUnsavedChanges: false,
+      dirtyFormKeys: [],
+      pendingOperations: [],
+      dirtySince: null,
+    },
+  };
+
+  // Write `ai-movie.json` once to initialize the Studio project
+  fs.writeFileSync(aiMoviePath, JSON.stringify(aiMovieManifest, null, 2), 'utf-8');
+
+  updated.projectMode = 'ai-movie';
+  updated.timeline.markers = updatedMarkers;
+  updated.sequence = updatedSequence;
+  saveVideoProjectManifest(projectRoot, updated);
+
+  const syncSummary = await computeAiMovieSyncSummary(projectRoot, updated);
+
+  return {
+    projectRoot,
+    project: updated,
+    aiMovieStatus: {
+      exists: true,
+      hasUnsavedChanges: false,
+      pendingOperationsCount: 0,
+    },
+    syncSummary,
+  };
+}
+
 export async function loadProjectFromFolder(projectRoot: string): Promise<LoadedProjectBundle> {
   const aiMovie = readAiMovieReadOnly(projectRoot);
   const existingManifestPath = findExistingVideoProjectPath(projectRoot);
@@ -1646,7 +2808,11 @@ export async function loadProjectFromFolder(projectRoot: string): Promise<Loaded
     // Scan shared assets folders (`assets/audio`, `assets/video`, `assets/images`, `audio/`)
     await scanSharedAssetsFolder(projectRoot, project.assets, activeSceneIds);
     // Clean up any orphaned scene markers or deleted/archived scenes on load
-    if (sanitizeProjectManifest(projectRoot, project, aiMovie)) {
+    const sanitized = sanitizeProjectManifest(projectRoot, project, aiMovie);
+    // Reconcile the saved timeline against media on disk (stale/archived takes, unlinked audio, invalid posters)
+    const reconciled = await reconcileProjectMedia(projectRoot, project, aiMovie);
+    const textDefaultsAdded = aiMovie ? applyStudioTextOverlayDefaults(project, aiMovie) : false;
+    if (sanitized || reconciled || textDefaultsAdded) {
       saveVideoProjectManifest(projectRoot, project);
     }
   } else if (aiMovie) {

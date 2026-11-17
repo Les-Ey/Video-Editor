@@ -38,6 +38,31 @@ export function getFfprobePath(): string {
   return resolveBinaryWithPermissions(ffprobeStatic?.path, 'ffprobe');
 }
 
+export function hasAudioStream(filePath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const ffprobe = getFfprobePath();
+    const proc = spawn(ffprobe, [
+      '-v',
+      'error',
+      '-select_streams',
+      'a',
+      '-show_entries',
+      'stream=index',
+      '-of',
+      'csv=p=0',
+      filePath,
+    ]);
+    let out = '';
+    proc.stdout.on('data', (chunk) => {
+      out += chunk.toString();
+    });
+    proc.on('close', () => {
+      resolve(out.trim().length > 0);
+    });
+    proc.on('error', () => resolve(false));
+  });
+}
+
 export async function probeMediaDuration(filePath: string): Promise<number> {
   return new Promise((resolve) => {
     const ffprobe = getFfprobePath();
@@ -62,6 +87,127 @@ export async function probeMediaDuration(filePath: string): Promise<number> {
     proc.on('error', () => {
       resolve(5.0);
     });
+  });
+}
+
+export interface ProbedChapterMarker {
+  id: string;
+  title: string;
+  startTimeSeconds: number;
+  endTimeSeconds: number;
+}
+
+/**
+ * Scenario 1 (Section 8): Losslessly remuxes an OBS `.mkv` recording to `.mp4` (`-map 0 -c copy`)
+ * so HTML5 `<video>` preview and FFmpeg sub-clipping work seamlessly without re-encoding.
+ */
+/**
+ * Extracts a single PNG frame from a video file at `timestampSec` (used when converting
+ * a Standalone / OBS project into a SpliceWright Studio project with `scenes/<id>/first-frame.png`).
+ */
+export async function extractVideoFrameToPng(
+  inputVideoPath: string,
+  timestampSec: number,
+  outputPngPath: string
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const ffmpeg = getFfmpegPath();
+    const safeSeek = Math.max(0, Math.round((timestampSec || 0) * 100) / 100);
+    const proc = spawn(ffmpeg, [
+      '-y',
+      '-ss',
+      String(safeSeek),
+      '-i',
+      inputVideoPath,
+      '-frames:v',
+      '1',
+      '-q:v',
+      '2',
+      outputPngPath,
+    ]);
+    proc.on('close', (code) => resolve(code === 0 && fs.existsSync(outputPngPath)));
+    proc.on('error', () => resolve(false));
+  });
+}
+
+export async function remuxMkvToMp4(inputMkvPath: string, outputMp4Path: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = getFfmpegPath();
+    const proc = spawn(ffmpeg, [
+      '-y',
+      '-i',
+      inputMkvPath,
+      '-map',
+      '0',
+      '-c',
+      'copy',
+      '-movflags',
+      '+faststart',
+      outputMp4Path,
+    ]);
+    let stderr = '';
+    proc.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`FFmpeg MKV remux failed (${code}): ${stderr.slice(-400)}`));
+      }
+    });
+    proc.on('error', (err) => reject(err));
+  });
+}
+
+/**
+ * Scenario 1 (Section 8): Inspects embedded OBS / MP4 / MKV chapter markers via `ffprobe -show_chapters`.
+ */
+export async function probeMediaChapters(filePath: string): Promise<ProbedChapterMarker[]> {
+  return new Promise((resolve) => {
+    const ffprobe = getFfprobePath();
+    const proc = spawn(ffprobe, [
+      '-v',
+      'quiet',
+      '-print_format',
+      'json',
+      '-show_chapters',
+      filePath,
+    ]);
+    let output = '';
+    proc.stdout.on('data', (chunk) => {
+      output += chunk.toString();
+    });
+    proc.on('close', () => {
+      try {
+        const parsed = JSON.parse(output) as {
+          chapters?: Array<{
+            id?: number | string;
+            start_time?: string | number;
+            end_time?: string | number;
+            tags?: { title?: string };
+          }>;
+        };
+        const rawChapters = parsed.chapters || [];
+        const results: ProbedChapterMarker[] = [];
+        rawChapters.forEach((ch, idx) => {
+          const start = Math.round((parseFloat(String(ch.start_time ?? 0)) || 0) * 100) / 100;
+          const end = Math.round((parseFloat(String(ch.end_time ?? 0)) || 0) * 100) / 100;
+          if (end > start + 0.2) {
+            results.push({
+              id: String(ch.id ?? idx + 1),
+              title: ch.tags?.title?.trim() || `Chapter ${idx + 1}`,
+              startTimeSeconds: start,
+              endTimeSeconds: end,
+            });
+          }
+        });
+        resolve(results);
+      } catch {
+        resolve([]);
+      }
+    });
+    proc.on('error', () => resolve([]));
   });
 }
 

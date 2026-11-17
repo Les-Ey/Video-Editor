@@ -1,5 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { TextOverlayInspector } from './TextOverlayInspector';
 import {
+  CLIP_FIT_MODE_LABELS,
+  ClipFitMode,
+  getClipTimelineDuration,
+  IMAGE_BACKGROUND_LABELS,
+  ImageBackground,
   KEN_BURNS_PRESET_LABELS,
   KenBurnsPreset,
   MediaAssetKind,
@@ -17,6 +23,7 @@ import {
   Upload,
   Sliders,
   Image as ImageIcon,
+  RefreshCw,
 } from 'lucide-react';
 
 interface MediaBinAndInspectorProps {
@@ -27,6 +34,7 @@ interface MediaBinAndInspectorProps {
   isExpandedWidth?: boolean;
   onImportMedia: (kind: MediaAssetKind) => void;
   onUpdateProject: (updater: (prev: VideoProjectManifest) => VideoProjectManifest) => void;
+  onRefreshSingleClip?: (clipId: string) => void;
 }
 
 export const MediaBinAndInspector: React.FC<MediaBinAndInspectorProps> = ({
@@ -37,9 +45,14 @@ export const MediaBinAndInspector: React.FC<MediaBinAndInspectorProps> = ({
   isExpandedWidth,
   onImportMedia,
   onUpdateProject,
+  onRefreshSingleClip,
 }) => {
   const [activeTab, setActiveTab] = useState<'all' | 'video' | 'dialogue' | 'sfx-bgm'>('all');
   const assetRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const [backgroundChoice, setBackgroundChoice] = useState<{
+    clipId: string;
+    background: ImageBackground;
+  } | null>(null);
 
   const filteredAssets = project.assets.filter((a) => {
     if (activeTab === 'video') return a.kind === 'video' || a.kind === 'image';
@@ -97,7 +110,7 @@ export const MediaBinAndInspector: React.FC<MediaBinAndInspectorProps> = ({
         mode === 'at-playhead'
           ? Math.round(playhead * 20) / 20
           : track.clips.reduce(
-              (max, c) => Math.max(max, c.timelineStart + (c.sourceOut - c.sourceIn)),
+              (max, c) => Math.max(max, c.timelineStart + getClipTimelineDuration(c)),
               0
             );
 
@@ -148,6 +161,29 @@ export const MediaBinAndInspector: React.FC<MediaBinAndInspectorProps> = ({
       case 'music':
         return <Music size={14} color="#f59e0b" />;
     }
+  };
+
+  const applyBackground = (allImages: boolean) => {
+    if (!backgroundChoice) return;
+    const { clipId, background } = backgroundChoice;
+    onUpdateProject((prev) => ({
+      ...prev,
+      timeline: {
+        ...prev.timeline,
+        tracks: prev.timeline.tracks.map((track) => ({
+          ...track,
+          clips: track.clips.map((clip) => {
+            const asset = prev.assets.find((a) => a.id === clip.assetId);
+            const isImage = track.type === 'video' && asset && !asset.isPlaceholderSlate &&
+              (asset.kind === 'image' || asset.isPosterFallback);
+            return isImage && (allImages || clip.id === clipId)
+              ? { ...clip, imageBackground: background }
+              : clip;
+          }),
+        })),
+      },
+    }));
+    setBackgroundChoice(null);
   };
 
   return (
@@ -382,7 +418,8 @@ export const MediaBinAndInspector: React.FC<MediaBinAndInspectorProps> = ({
         style={{
           width: isExpandedWidth ? '38%' : '100%',
           height: isExpandedWidth ? '100%' : undefined,
-          overflowY: isExpandedWidth ? 'auto' : undefined,
+          overflowY: 'auto',
+          maxHeight: isExpandedWidth ? undefined : '55%',
           borderTop: isExpandedWidth ? 'none' : '1px solid #1e293b',
           background: '#0f1626',
           padding: '10px 12px',
@@ -411,18 +448,53 @@ export const MediaBinAndInspector: React.FC<MediaBinAndInspectorProps> = ({
             Click any clip on the timeline to inspect or fine-tune its start time, trim bounds,
             volume, or fades.
           </div>
+        ) : selectedTrackType === 'text' && selectedClip.textOverlay ? (
+          <TextOverlayInspector
+            clip={selectedClip}
+            overlay={selectedClip.textOverlay}
+            onChange={updateSelectedClipField}
+          />
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '12px' }}>
             <div
               style={{
-                fontWeight: 600,
-                color: '#f8fafc',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '8px',
               }}
             >
-              {selectedClip.label}
+              <div
+                style={{
+                  fontWeight: 600,
+                  color: '#f8fafc',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                }}
+              >
+                {selectedClip.label}
+              </div>
+
+              {onRefreshSingleClip && (
+                <button
+                  type="button"
+                  onClick={() => onRefreshSingleClip(selectedClip!.id)}
+                  title="Reload only this clip's audio, image, or video file from disk / SpliceWright Studio without rebuilding or shifting the rest of the timeline"
+                  style={{
+                    ...placeBtnStyle,
+                    background: 'rgba(16, 185, 129, 0.16)',
+                    border: '1px solid #10b981',
+                    color: '#34d399',
+                    fontWeight: 600,
+                    padding: '3px 8px',
+                    flexShrink: 0,
+                  }}
+                >
+                  <RefreshCw size={11} />
+                  <span>Refresh Clip Media</span>
+                </button>
+              )}
             </div>
 
             {selectedAsset && (
@@ -485,10 +557,54 @@ export const MediaBinAndInspector: React.FC<MediaBinAndInspectorProps> = ({
             </div>
 
             {selectedTrackType === 'video' && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '2px' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '2px' }}>
+                {selectedAsset && !selectedAsset.isPlaceholderSlate &&
+                  (selectedAsset.kind === 'image' || selectedAsset.isPosterFallback) && (
+                  <label style={inspectorFieldStyle}>
+                    <span>Image Background</span>
+                    <select
+                      value={selectedClip.imageBackground || 'black'}
+                      onChange={(e) => setBackgroundChoice({
+                        clipId: selectedClip!.id,
+                        background: e.target.value as ImageBackground,
+                      })}
+                      style={inspectorInputStyle}
+                    >
+                      {(Object.keys(IMAGE_BACKGROUND_LABELS) as ImageBackground[]).map((background) => (
+                        <option key={background} value={background}>
+                          {IMAGE_BACKGROUND_LABELS[background]}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                <label style={inspectorFieldStyle}>
+                  <span style={{ color: '#c084fc', fontWeight: 600 }}>
+                    Fit / Stretch Mode (Aspect Ratio Framing)
+                  </span>
+                  <select
+                    value={selectedClip.fitMode || 'contain'}
+                    onChange={(e) =>
+                      updateSelectedClipField({
+                        fitMode: e.target.value as ClipFitMode,
+                      })
+                    }
+                    style={{
+                      ...inspectorInputStyle,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {(Object.keys(CLIP_FIT_MODE_LABELS) as ClipFitMode[]).map((fitKey) => (
+                      <option key={fitKey} value={fitKey}>
+                        {CLIP_FIT_MODE_LABELS[fitKey]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
                 <label style={inspectorFieldStyle}>
                   <span style={{ color: '#38bdf8', fontWeight: 600 }}>
-                    Still Image / Camera Motion (Ken Burns Effect)
+                    Still Image / Camera Motion (Ken Burns & Star Wars Crawl)
                   </span>
                   <select
                     value={selectedClip.kenBurns || 'none'}
@@ -509,6 +625,71 @@ export const MediaBinAndInspector: React.FC<MediaBinAndInspectorProps> = ({
                     ))}
                   </select>
                 </label>
+
+                {/* Scenario 1 (Section 8): Playback Speed (`playbackRate`) & Source Audio Mute for Video Takes / OBS Screencasts */}
+                {selectedAsset && selectedAsset.kind === 'video' && (
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: '1fr 1fr',
+                      gap: '8px',
+                      alignItems: 'center',
+                      marginTop: '2px',
+                    }}
+                  >
+                    <label style={inspectorFieldStyle}>
+                      <span style={{ color: '#fbbf24', fontWeight: 600 }}>
+                        Playback Speed ({selectedClip.playbackRate || 1}x →{' '}
+                        {getClipTimelineDuration(selectedClip).toFixed(1)}s on timeline)
+                      </span>
+                      <select
+                        value={String(selectedClip.playbackRate || 1)}
+                        onChange={(e) =>
+                          updateSelectedClipField({
+                            playbackRate: Math.max(0.25, parseFloat(e.target.value) || 1),
+                          })
+                        }
+                        style={{
+                          ...inspectorInputStyle,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        <option value="0.5">0.5x (Slow Motion)</option>
+                        <option value="0.75">0.75x (Slight Slow)</option>
+                        <option value="1">1.0x (Normal Speed)</option>
+                        <option value="1.25">1.25x (Brisk)</option>
+                        <option value="1.5">1.5x (Fast Demo)</option>
+                        <option value="2">2.0x (Double Speed)</option>
+                        <option value="3">3.0x (3x Typing / Wait Fast-Forward)</option>
+                        <option value="4">4.0x (4x Time-Lapse)</option>
+                      </select>
+                    </label>
+
+                    <label
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        fontSize: '11px',
+                        color: '#cbd5e1',
+                        marginTop: '14px',
+                        cursor: 'pointer',
+                      }}
+                      title="Mute rough OBS mic audio when replaced by ElevenLabs narration on the Dialogue track, or uncheck to include embedded video audio"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedClip.muteSourceAudio !== false}
+                        onChange={(e) =>
+                          updateSelectedClipField({
+                            muteSourceAudio: e.target.checked,
+                          })
+                        }
+                      />
+                      <span>Mute Source Video Audio</span>
+                    </label>
+                  </div>
+                )}
               </div>
             )}
 
@@ -594,6 +775,39 @@ export const MediaBinAndInspector: React.FC<MediaBinAndInspectorProps> = ({
           </div>
         )}
       </div>
+      {backgroundChoice && (
+        <div
+          style={{
+            position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(0,0,0,0.65)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="image-background-prompt"
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === 'Escape') setBackgroundChoice(null);
+            }}
+            style={{
+              background: '#101a2d', border: '1px solid #334155', borderRadius: '8px',
+              padding: '22px', color: '#e2e8f0', maxWidth: '420px',
+            }}
+          >
+            <h3 id="image-background-prompt" style={{ marginTop: 0 }}>Apply to all images?</h3>
+            <p>
+              Use {IMAGE_BACKGROUND_LABELS[backgroundChoice.background]} for every image clip
+              on the timeline, or only this clip? Video clips are unchanged.
+            </p>
+            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+              <button style={placeBtnStyle} onClick={() => setBackgroundChoice(null)}>Cancel</button>
+              <button autoFocus style={placeBtnStyle} onClick={() => applyBackground(false)}>This image only</button>
+              <button style={placeBtnStyle} onClick={() => applyBackground(true)}>Apply to all images</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

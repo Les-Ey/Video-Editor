@@ -32,6 +32,7 @@ If **SpliceWright** saves you time assembling AI movies, storyboards, and voiceo
 
 ### 2. Intelligent Visuals, Camera Motion & Look Presets
 
+* **Editable Text Overlays:** Add text above stills or video, drag it in the Program Monitor, and move/trim its dedicated timeline clips. Choose basic font, size, and colour controls; preview and MP4 share the same screen-fixed rendered text, separate from captions and SRT.
 * **Auto-Inferred Ken Burns Camera Motion:** Automatically reads storyboard `cameraDirection` cues (`zoom-in`, `zoom-out`, `pan-top-to-bottom`, `pan-left-to-right`, etc.) and applies smooth 2× supersampled `zoompan` motion to still poster frames.
 * **Non-Destructive Visual & Vintage Audio Look Presets:** Apply project-wide looks—including *Cinematic Contrast*, *Noir Monochrome*, *1920s Vintage Film (Sepia + Temporal Grain + Vignette)*, *Old Film + Vintage Projector Audio (`300Hz–3.2kHz` band-pass + compressed dynamic range)*, and *Muted Documentary*—both in live preview and during FFmpeg export.
 * **Multi-Aspect Ratio Support:** Switch freely between `16:9` (1920×1080), `9:16` Vertical (1080×1920), `1:1` Square (1080×1080), `21:9` Cinema (2560×1080), and `4:3` Classic (1440×1080).

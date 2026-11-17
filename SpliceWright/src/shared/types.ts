@@ -29,10 +29,16 @@ export interface AiMovieAudioAsset {
   startTimeSeconds?: number;
 }
 
+export interface AiMovieVideoSegment {
+  sourceInSeconds: number;
+  sourceOutSeconds: number;
+  playbackRate?: number;
+}
+
 export interface AiMovieVideoTake {
   id: string;
   label?: string;
-  fileName: string; // e.g. "scenes/scene-1/videos/video-1730002000.mp4" or "videos/video-1730005000.mp4"
+  fileName: string; // e.g. "scenes/scene-1/videos/video-1730002000.mp4" or "assets/video/obs-demo.mp4"
   source?: string;
   providerModel?: string;
   prompt?: string;
@@ -40,6 +46,14 @@ export interface AiMovieVideoTake {
   durationSeconds: number;
   aspectRatio?: string;
   resolution?: string;
+  /** Scenario 1 (Section 8): Non-destructive trim, speed & source audio controls */
+  sourceInSeconds?: number;
+  sourceOutSeconds?: number;
+  playbackRate?: number;
+  muteSourceAudio?: boolean;
+  fitMode?: ClipFitMode;
+  kenBurns?: KenBurnsPreset;
+  segments?: AiMovieVideoSegment[];
   properties?: Record<string, unknown>;
 }
 
@@ -51,6 +65,8 @@ export interface AiMovieScene {
   status?: string;
   summary?: string;
   dialogue?: string;
+  /** Optional initial editor text; the editor takes ownership after first import. */
+  defaultTextOverlay?: string;
   notes?: string;
   durationSeconds: number;
   aspectRatio?: string;
@@ -63,6 +79,8 @@ export interface AiMovieScene {
     selectedVideoId?: string; // e.g. "video-1730002000" (Studio v0.0.66+ preferred take)
     order?: number;
     sceneOrder?: number;
+    fitMode?: ClipFitMode;
+    kenBurns?: KenBurnsPreset;
     [key: string]: unknown;
   };
 }
@@ -133,9 +151,31 @@ export interface ProjectMediaAsset {
   isPlaceholderSlate?: boolean;
   originalRelativePath?: string;
   isNormalized?: boolean;
+  /** Cache-busting revision timestamp when the underlying file on disk is refreshed in-place */
+  cacheVersion?: number;
+  /** Scenario 1 (Section 8): Embedded OBS / video chapter markers discovered via ffprobe */
+  probedChapters?: Array<{
+    id: string;
+    title: string;
+    startTimeSeconds: number;
+    endTimeSeconds: number;
+  }>;
 }
 
-export type TrackType = 'video' | 'dialogue' | 'sfx' | 'music';
+export type TrackType = 'video' | 'dialogue' | 'sfx' | 'music' | 'text';
+
+export interface TextOverlay {
+  text: string;
+  fontFamily: 'sans-serif' | 'serif' | 'monospace';
+  /** Font size in output-frame pixels. */
+  fontSize: number;
+  color: string;
+  /** Optional background behind the text, with opacity from 0 to 1. */
+  background?: { color: string; opacity: number };
+  /** Top-left position as fractions of the output frame, independent of media motion. */
+  x: number;
+  y: number;
+}
 
 export type KenBurnsPreset =
   | 'none'
@@ -147,7 +187,31 @@ export type KenBurnsPreset =
   | 'pan-right-to-left'
   | 'zoom-in-top-left'
   | 'zoom-in-top-right'
-  | 'zoom-in-bottom';
+  | 'zoom-in-bottom'
+  | 'star-wars-crawl';
+
+export type ClipFitMode =
+  | 'contain'
+  | 'stretch-fill'
+  | 'fill-width'
+  | 'fill-height'
+  | 'cover-crop';
+
+export type ImageBackground = 'black' | 'mottled' | 'softened';
+
+export const IMAGE_BACKGROUND_LABELS: Record<ImageBackground, string> = {
+  black: 'Plain (Black)',
+  mottled: 'Mottled',
+  softened: 'Softened Image',
+};
+
+export const CLIP_FIT_MODE_LABELS: Record<ClipFitMode, string> = {
+  contain: '1. Fit Inside (Letterbox / Pillarbox — Default)',
+  'stretch-fill': '2. Stretch to Fill Frame (Stretch Wide 16:9 / Stretch Tall 9:16)',
+  'fill-width': '3. Fit Full Width (Wide 16:9 — Ideal for Document Scroll)',
+  'fill-height': '4. Fit Full Height (Tall 9:16 — Ideal for Horizontal Pan)',
+  'cover-crop': '5. Zoom to Fill / Cover (No Black Bars)',
+};
 
 export type VisualLookPreset =
   | 'none'
@@ -177,6 +241,7 @@ export const KEN_BURNS_PRESET_LABELS: Record<KenBurnsPreset, string> = {
   'zoom-in-top-left': '6a. Zoom In Top-Left Corner',
   'zoom-in-top-right': '6b. Zoom In Top-Right Corner',
   'zoom-in-bottom': '6c. Zoom In Bottom / Timeline Area',
+  'star-wars-crawl': '7. Star Wars Crawl (3D Perspective Scroll)',
 };
 
 export interface TimelineClip {
@@ -199,8 +264,32 @@ export interface TimelineClip {
   fadeOut?: number;
   /** Camera motion / Ken Burns effect for still images (or video reframing) */
   kenBurns?: KenBurnsPreset;
+  /** Aspect-ratio framing / stretch mode (default 'contain') */
+  fitMode?: ClipFitMode;
+  /** Stationary still-image backdrop; omitted settings retain the original black framing. */
+  imageBackground?: ImageBackground;
+  /** Generated text clips live on a text track and have no source media asset. */
+  textOverlay?: TextOverlay;
+  /** Scenario 1 (Section 8): Playback speed multiplier (default 1.0, e.g. 0.5 to 4.0) */
+  playbackRate?: number;
+  /** Scenario 1 (Section 8): Whether to mute embedded audio on a video clip (default true when scene has dialogue) */
+  muteSourceAudio?: boolean;
   /** Available video takes for this scene (allows 1-click take switching on timeline) */
   availableTakeAssetIds?: string[];
+  /** Set on load when this clip's media file is missing, archived, or not a valid image (shows a "Missing media" state) */
+  missingMedia?: boolean;
+}
+
+/**
+ * Computes the effective timeline duration of a clip in seconds:
+ * `(sourceOut - sourceIn) / (playbackRate || 1.0)`
+ */
+export function getClipTimelineDuration(
+  clip: Pick<TimelineClip, 'sourceIn' | 'sourceOut' | 'playbackRate'>
+): number {
+  const rawSpan = Math.max(0.1, (clip.sourceOut || 0) - (clip.sourceIn || 0));
+  const rate = clip.playbackRate && clip.playbackRate > 0 ? clip.playbackRate : 1.0;
+  return Math.max(0.1, Math.round((rawSpan / rate) * 100) / 100);
 }
 
 export interface TimelineTrack {
@@ -287,6 +376,8 @@ export interface VideoProjectManifest {
   lookPreset?: VisualLookPreset;
   /** Scene IDs explicitly deleted/dismissed on the timeline so Sync Studio does not resurrect empty slates */
   dismissedSceneIds?: string[];
+  /** Scenes whose Studio text default was consumed, including overlays later deleted by the editor. */
+  studioTextOverlayDefaultsApplied?: string[];
   /** Relative path to pre-mixed master audio MP3 (`exports/.cache/preview-audio-mix.mp3`) for zero-lag live preview */
   preMixedAudioRelativePath?: string;
   /** Signature of audio tracks when `preMixedAudioRelativePath` was rendered */
@@ -361,6 +452,56 @@ export interface StitchChaptersOptions {
   mergeSubtitles: boolean;
 }
 
+export interface StudioUpdateAddedAssetEntry {
+  id: string;
+  kind: MediaAssetKind;
+  label: string;
+  relativePath: string;
+  durationSeconds: number;
+  sceneId?: string;
+  sceneOrder?: number;
+  assignment: 'assigned-scene' | 'new-scene' | 'shared-project';
+  placedAtTimelineSeconds?: number;
+  sourceInSeconds?: number;
+  sourceOutSeconds?: number;
+  playbackRate?: number;
+  muteSourceAudio?: boolean;
+  fitMode?: ClipFitMode;
+  kenBurns?: KenBurnsPreset;
+  addedAt: string;
+}
+
+export interface StudioUpdateSceneTimelineEntry {
+  sceneId: string;
+  sceneOrder: number;
+  title: string;
+  timelineStartSeconds: number;
+  visualDurationSeconds: number;
+  selectedAssetId?: string;
+  selectedRelativePath: string | null;
+  isCustomEditorSelection?: boolean;
+  fitMode?: ClipFitMode;
+  kenBurns?: KenBurnsPreset;
+  playbackRate?: number;
+  muteSourceAudio?: boolean;
+  segments?: AiMovieVideoSegment[];
+}
+
+export interface StudioUpdatesManifest {
+  schemaVersion: '1.0';
+  projectTitle: string;
+  updatedAt: string;
+  addedAssets: StudioUpdateAddedAssetEntry[];
+  sceneTimelineUpdates: StudioUpdateSceneTimelineEntry[];
+}
+
+export interface ImportMediaSceneTarget {
+  mode: 'assigned-scene' | 'new-scene' | 'shared-project';
+  sceneId?: string;
+  sceneOrder?: number;
+  sceneTitle?: string;
+}
+
 export interface AiMovieSyncSummary {
   hasChanges: boolean;
   aiMovieBusy: boolean;
@@ -369,6 +510,8 @@ export interface AiMovieSyncSummary {
   newDialogueCount: number;
   newScenesCount: number;
   durationChangesCount?: number;
+  modifiedMediaCount?: number;
+  newTextOverlaysCount?: number;
 }
 
 export interface LoadedProjectBundle {
@@ -390,16 +533,26 @@ export interface SpliceWrightApi {
   selectFolderDialog: (title?: string) => Promise<string | null>;
   openProjectFolder: (folderPath: string) => Promise<LoadedProjectBundle>;
   createStandaloneProject: (folderPath: string, title: string, aspectRatio: string) => Promise<LoadedProjectBundle>;
+  convertStandaloneToStudioProject: (
+    projectRoot: string,
+    currentProject: VideoProjectManifest
+  ) => Promise<LoadedProjectBundle>;
   saveProject: (projectRoot: string, project: VideoProjectManifest) => Promise<{ savedPath: string }>;
   importExternalMedia: (
     projectRoot: string,
-    targetKind: MediaAssetKind
+    targetKind: MediaAssetKind,
+    sceneTarget?: ImportMediaSceneTarget
   ) => Promise<ProjectMediaAsset[]>;
   syncFromAiMovie: (
     projectRoot: string,
     currentProject: VideoProjectManifest,
     mode: 'merge-new-assets' | 'reset-to-ai-movie'
   ) => Promise<LoadedProjectBundle>;
+  refreshSingleClipMedia: (
+    projectRoot: string,
+    currentProject: VideoProjectManifest,
+    clipId: string
+  ) => Promise<{ project: VideoProjectManifest; refreshedLabel: string; newDurationSeconds: number }>;
   exportMovie: (
     projectRoot: string,
     project: VideoProjectManifest,

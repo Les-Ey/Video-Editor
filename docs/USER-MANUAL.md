@@ -85,9 +85,10 @@ On the Welcome Screen, you can start in one of three ways:
    * **SpliceWright** reads `ai-movie.json` strictly as **Read-Only (`R/O`)**—it never modifies your Studio story file.
    * All scenes, video takes, storyboard takes, `first-frame` posters, ElevenLabs dialogue lines, and SFX/camera cues are assembled onto the multi-track timeline automatically.
    * All timeline edits and rendered outputs are saved inside `exports/video-project.json` and `exports/`.
-2. **Standalone Folder Mode:**
+2. **Standalone Folder Mode (with Optional 1-Click `Convert to Studio Project`):**
    * Select any folder on your computer or external SSD.
-   * Import your own video clips, still images, voiceovers, backing music, and sound effects. Imported media is organized inside `assets/video/` and `assets/audio/` so your project remains 100% self-contained.
+   * Import your own video clips (including OBS `.mkv` recordings with embedded Chapter Markers), still images, voiceovers, backing music, and sound effects. Imported media is organized inside `assets/video/` and `assets/audio/` so your project remains 100% self-contained.
+   * **Convert to Studio Project:** Because `ai-movie.json` does not exist yet in a Standalone folder, you can click **`Convert to Studio Project`** in the top bar (or inside **`Tools & Project ▾`**) at any time to generate `ai-movie.json`, extract `scenes/scene-N/first-frame.png` thumbnails from your timeline clips, and promote the folder into a **SpliceWright Studio** project (which then switches to standard `ai-movie.json R/O` monitoring).
 3. **Try Sample AI Movie:**
    * Generates and loads a complete playable sample project (*"Neon Gate"*) so you can explore take switching, Ken Burns motion, audio leveling, and MP4 export immediately.
 
@@ -100,8 +101,8 @@ The **SpliceWright** editor is divided into four areas:
 1. **Top Header Bar:**
    * **Aspect Ratio Selector:** Switch project output format at any time between `16:9 Widescreen (1920×1080)`, `9:16 Vertical (1080×1920)`, `1:1 Square (1080×1080)`, `21:9 Cinema (2560×1080)`, and `4:3 Classic (1440×1080)`.
    * **Look Preset Selector:** Apply non-destructive visual color grades and vintage audio filters across the project.
-   * **Sync Studio / Rebuild:** Appears when monitoring a **SpliceWright Studio** folder. Alerts you when new video takes, dialogue audio, or scenes are saved in Studio.
-   * **Stitch Chapters / 2nd Screen / Save / Export MP4:** Quick access to long-form chapter stitching, dual-monitor mode, saving `exports/video-project.json`, and rendering MP4 video.
+   * **Sync Studio / Convert to Studio Project:** Shows **Sync Studio** when monitoring a **SpliceWright Studio** folder, or **Convert to Studio Project** when working in Standalone Folder Mode.
+   * **2nd Screen / Save / Export MP4 / Tools & Project ▾:** Direct access to dual-monitor mode, saving `exports/video-project.json`, rendering MP4 video, and the **`Tools & Project ▾`** menu (**Open Project Folder**, **Standalone Folder Mode**, **Convert to Studio Project**, **Stitch Chapters**, and hardware encoder info).
 2. **Program Monitor (Top-Left):**
    * Live preview player with double-buffered video decks, Ken Burns camera motion preview, live dialogue captions, timecode readout, and Full Screen mode (`F` or double-click).
 3. **Media Bin & Clip Inspector (Top-Right):**
@@ -135,17 +136,41 @@ The **SpliceWright** editor is divided into four areas:
 
 ## 5. Scene Takes, Still Posters & Ken Burns Camera Motion
 
+* **Text Overlays (Still Images and Video):**
+  1. Put the playhead where the text should start and click **Add Text** in the timeline toolbar. Playback pauses, and the Clip Inspector opens a text box.
+  2. Enter your text (including line breaks). The default is bold white Sans Serif with a black outline. **Font**, **Size (px)**, and **Colour** controls are available when needed. Enable **Text background** to add a coloured box behind the text, then choose its colour and transparency (0% opaque, 100% transparent).
+  3. Drag the text directly in the **Program Monitor** to position it. Text stays in screen coordinates, independent of the underlying still's zoom/pan or video playback. Switch off **2nd Screen** temporarily to position text in the main editor.
+  4. Move the purple clip on the **Text Overlays** track to change its start; drag either edge to trim its duration. You can also edit **Start (s)** and **Duration (s)** in the Inspector, split or delete text clips, and hide/show the text track. **Undo/Redo** supports these changes, including a complete positioning drag as one action.
+  * New text starts at the playhead for up to five seconds (or the remaining current visual clip, with a quarter-second minimum). Text can span multiple image/video clips or extend over a black timeline gap.
+  * Long lines wrap within the output frame. Oversized text is clipped to the frame; reduce its font size or split it into shorter overlays when necessary.
+  * **Save** stores editable text, position, style, and timing in `exports/video-project.json`, not in the original image/video. MP4 export uses the same rendered text as the Program Monitor. Text is separate from **Live Captions** and is **never added to SRT subtitles or the audio mix**.
+  * **Studio scene defaults:** Studio may supply an optional multiline `scene.defaultTextOverlay`. Nonempty text is imported once, spanning that scene's visual timeline range, using the same editable text feature. After import the editor owns it: edits, styling, timing, and deletion survive later syncs, reopening, and Studio rebuilds, even if Studio changes or removes its default. New defaults added to existing scenes are offered through Studio sync (or imported when reopening). Missing/blank defaults leave older projects unchanged.
 * **1-Click Scene Take Switching:**
   * When a scene has multiple video takes (or a `first-frame.png` poster), a **Take Selector dropdown** appears directly on the blue scene clip in the timeline. Select any take from the dropdown to switch the active shot immediately.
-* **Still Posters & Camera Motion (Ken Burns Effect):**
+* **Still Image Backgrounds:**
+  * Select an image or poster clip and choose **Image Background** in the **Clip Inspector**: **Plain (Black)**, **Mottled** (a subtle dark texture), or **Softened Image** (a blurred, darkened copy of that clip's still).
+  * The **Apply to all images?** prompt offers **This image only**, **Apply to all images**, or **Cancel**. Applying to all changes existing image clips on the timeline, including other scenes, but not videos or placeholder slates. Each softened background uses its own clip's image.
+  * Backgrounds stay stationary while foreground zoom/pan runs, in the Program Monitor and MP4 export. Fit/Stretch and camera-motion settings are preserved. Save the project to keep the choices in `exports/video-project.json`; no Studio manifest changes or source-image edits are needed. Existing projects default to black.
+* **Fit / Stretch Modes & Camera Motion (Ken Burns + Star Wars Crawl):**
   * When a scene uses a still image or poster frame, **SpliceWright** automatically infers a camera motion preset from your storyboard's `cameraDirection`.
-  * To customize the motion on any clip, select the clip and use the **Still Image / Camera Motion (Ken Burns Effect)** dropdown in the **Clip Inspector**:
+  * For tall/narrow screenshots (e.g., long document captures in a `16:9` project) or wide images in a `9:16` project, select the clip and use the **Fit / Stretch Mode (Aspect Ratio Framing)** dropdown in the **Clip Inspector**:
+    * `1. Fit Inside (Letterbox / Pillarbox — Default)`
+    * `2. Stretch to Fill Frame (Stretch Wide 16:9 / Stretch Tall 9:16)` — Stretches narrow clips wide or wide clips tall to fill the entire frame.
+    * `3. Fit Full Width (Wide 16:9 — Ideal for Document Scroll)` — Scales narrow/tall document images to full 16:9 width so vertical scrolling fills the entire screen without side pillarboxes.
+    * `4. Fit Full Height (Tall 9:16 — Ideal for Horizontal Pan)` — Scales wide clips to full vertical height.
+    * `5. Zoom to Fill / Cover (No Black Bars)` — Aspect-ratio-preserving center fill.
+  * Combine any Fit Mode with the **Still Image / Camera Motion (Ken Burns & Star Wars Crawl)** dropdown:
     * `1. None (Static Hold)`
     * `2. Slow Zoom In (Center Push-In)`
     * `3. Slow Zoom Out (Pull-Back)`
-    * `4a. Pan Top-to-Bottom` / `4b. Pan Bottom-to-Top`
+    * `4a. Pan Top-to-Bottom (Document Scroll)` / `4b. Pan Bottom-to-Top (Reverse Scroll)`
     * `5a. Pan Left-to-Right` / `5b. Pan Right-to-Left`
     * `6a. Zoom In Top-Left` / `6b. Zoom In Top-Right` / `6c. Zoom In Bottom`
+    * `7. Star Wars Crawl (3D Perspective Scroll)` — Tilts the image or document in 3D perspective and scrolls it upward into the distance like the classic *Star Wars* opening crawl.
+* **Playback Speed (`0.5x` – `4.0x`), Source Audio Mute & OBS `.mkv` Chapter Import (Scenario 1 & 2):**
+  * Select any video clip to set its **Playback Speed (`0.5x` to `4.0x`)** (e.g. `3x` or `4x` to fast-forward through silent waiting/typing sections of an OBS screencast after splitting with **Split Clip at Playhead**) and toggle **Mute Source Video Audio**.
+  * When importing an OBS `.mkv` recording, **SpliceWright** losslessly remuxes it to `.mp4` (`-c copy`) and detects any embedded OBS Chapter Markers, offering to place non-destructive sub-clips for each chapter onto the timeline.
+  * **Automatic Multi-Scene Audio Spanning:** If an Anchor Scene has long narration and the following scenes have no dialogue of their own, those subsequent scenes cut visually on `track_video_main` while the Anchor Scene's narration plays continuously underneath.
 
 ---
 

@@ -4,7 +4,9 @@ import {
   ExportOptions,
   ExportPreset,
   ExportProgressEvent,
+  getClipTimelineDuration,
   HardwareProfile,
+  ImportMediaSceneTarget,
   LoadedProjectBundle,
   MediaAssetKind,
   StitchCatalogue,
@@ -36,6 +38,8 @@ import {
   Trash2,
   Monitor,
   Coffee,
+  ChevronDown,
+  Wand2,
 } from 'lucide-react';
 
 const BUY_ME_A_COFFEE_URL = 'https://www.buymeacoffee.com/les.ey';
@@ -61,6 +65,8 @@ export const App: React.FC = () => {
   const [isNormalizing, setIsNormalizing] = useState<boolean>(false);
   const [isPreMixingAudio, setIsPreMixingAudio] = useState<boolean>(false);
   const [isBusy, setIsBusy] = useState<boolean>(false);
+  const [isStudioAutoLaunching, setIsStudioAutoLaunching] = useState<boolean>(true);
+  const [studioLaunchPath, setStudioLaunchPath] = useState<string | null>(null);
 
   const liveStateRef = useRef<{
     projectRoot: string | null;
@@ -83,6 +89,14 @@ export const App: React.FC = () => {
 
   const [showExportModal, setShowExportModal] = useState<boolean>(false);
   const [showSyncModal, setShowSyncModal] = useState<boolean>(false);
+  const [showToolsMenu, setShowToolsMenu] = useState<boolean>(false);
+  const toolsMenuRef = useRef<HTMLDivElement | null>(null);
+
+  // Scene Assignment Modal when importing media into a Studio project (Section 7 of what-studio-needs-to-know.md)
+  const [pendingImportKind, setPendingImportKind] = useState<MediaAssetKind | null>(null);
+  const [importSceneSelection, setImportSceneSelection] = useState<string>('shared-project');
+  const [importNewSceneTitle, setImportNewSceneTitle] = useState<string>('New Scene');
+  const [importAutoPlaceOnTimeline, setImportAutoPlaceOnTimeline] = useState<boolean>(true);
   const [exportFileName, setExportFileName] = useState<string>('final-cut.mp4');
   const [exportPreset, setExportPreset] = useState<ExportPreset>('balanced');
   const [exportEncoder, setExportEncoder] = useState<string>('libx264');
@@ -174,13 +188,26 @@ export const App: React.FC = () => {
       }
     });
 
-    window.spliceWright.getLaunchProjectFolder().then(async (launchFolder) => {
-      if (launchFolder) {
-        const bundle = await window.spliceWright.openProjectFolder(launchFolder);
-        applyLoadedBundle(bundle);
-        showToast(`Opened project from SpliceWright Studio: ${bundle.project.title}`);
-      }
-    });
+    window.spliceWright
+      .getLaunchProjectFolder()
+      .then(async (launchFolder) => {
+        if (launchFolder) {
+          setStudioLaunchPath(launchFolder);
+          setIsStudioAutoLaunching(true);
+          try {
+            const bundle = await window.spliceWright.openProjectFolder(launchFolder);
+            applyLoadedBundle(bundle);
+            showToast(`Opened project from SpliceWright Studio: ${bundle.project.title}`);
+          } finally {
+            setIsStudioAutoLaunching(false);
+          }
+        } else {
+          setIsStudioAutoLaunching(false);
+        }
+      })
+      .catch(() => {
+        setIsStudioAutoLaunching(false);
+      });
 
     const unsubAi = window.spliceWright.onAiMovieUpdated((summary) => {
       setSyncSummary(summary);
@@ -218,6 +245,13 @@ export const App: React.FC = () => {
     const unsubDualMonitor = window.spliceWright.onDualMonitorStateChanged((isOpen) => {
       setIsDualMonitorOpen(isOpen);
     });
+
+    const onDocMouseDown = (ev: MouseEvent) => {
+      if (toolsMenuRef.current && !toolsMenuRef.current.contains(ev.target as Node)) {
+        setShowToolsMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocMouseDown);
 
     // Topic 14: BroadcastChannel for real-time Dual Monitor Program Preview sync
     const bc = new BroadcastChannel('splicewright-dual-monitor');
@@ -262,6 +296,7 @@ export const App: React.FC = () => {
       unsubExport();
       unsubExternalManifest();
       unsubDualMonitor();
+      document.removeEventListener('mousedown', onDocMouseDown);
       bc.close();
     };
   }, [isExternalMonitorMode]);
@@ -296,7 +331,8 @@ export const App: React.FC = () => {
     let maxDuration = 5;
     for (const tr of project.timeline.tracks) {
       for (const c of tr.clips) {
-        const end = c.timelineStart + Math.max(0.1, c.sourceOut - c.sourceIn);
+        const end =
+          c.timelineStart + Math.max(0.1, (c.sourceOut - c.sourceIn) / (c.playbackRate || 1.0));
         if (end > maxDuration) maxDuration = end;
       }
     }
@@ -476,6 +512,25 @@ export const App: React.FC = () => {
     }
   };
 
+  // Convert Standalone Project -> SpliceWright Studio Project (creates `ai-movie.json` only when it doesn't exist yet)
+  const handleConvertStandaloneToStudio = async () => {
+    if (!projectRoot || !project || aiMovieExists) return;
+    setShowToolsMenu(false);
+    setIsBusy(true);
+    try {
+      showToast('Converting Standalone project to SpliceWright Studio (creating ai-movie.json & scene thumbnails)...');
+      const bundle = await window.spliceWright.convertStandaloneToStudioProject(projectRoot, project);
+      applyLoadedBundle(bundle);
+      showToast(
+        `Converted to SpliceWright Studio project! Created ai-movie.json with ${bundle.project.sequence.length} scene(s).`
+      );
+    } catch (err) {
+      showToast(`Convert error: ${(err as Error).message}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
   const handleSaveProject = async () => {
     if (!projectRoot || !project) return;
     setIsBusy(true);
@@ -487,28 +542,252 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleImportMedia = async (kind: MediaAssetKind) => {
+  const executeMediaImportWithTarget = async (
+    kind: MediaAssetKind,
+    sceneTarget?: ImportMediaSceneTarget,
+    autoPlace?: boolean
+  ) => {
     if (!projectRoot || !project) return;
     setIsBusy(true);
     try {
-      const imported = await window.spliceWright.importExternalMedia(projectRoot, kind);
+      const imported = await window.spliceWright.importExternalMedia(
+        projectRoot,
+        kind,
+        sceneTarget
+      );
       if (imported.length === 0) return;
 
-      setProject((prev) => {
-        if (!prev) return prev;
+      let placedChapterClipsCount = 0;
+      let updatedSnapshot: VideoProjectManifest | null = null;
+
+      updateProjectWithHistory((prev) => {
         const next: VideoProjectManifest = JSON.parse(JSON.stringify(prev));
         next.assets.push(...imported);
+
+        const vidTrack = next.timeline.tracks.find((t) => t.type === 'video');
+        const dlgTrack = next.timeline.tracks.find((t) => t.type === 'dialogue');
+        const sfxTrack = next.timeline.tracks.find((t) => t.type === 'sfx');
+        const musTrack = next.timeline.tracks.find((t) => t.type === 'music');
+
+        // If user chose "Create New Scene" in the Scene Assignment prompt, register the new scene heading & sequence item
+        if (sceneTarget?.mode === 'new-scene' && sceneTarget.sceneId) {
+          const newSceneId = sceneTarget.sceneId;
+          const newSceneOrder = sceneTarget.sceneOrder || next.sequence.length + 1;
+          const newTitle = sceneTarget.sceneTitle || `Scene ${newSceneOrder}`;
+          const trackEnd = (vidTrack?.clips || []).reduce(
+            (max, c) => Math.max(max, c.timelineStart + getClipTimelineDuration(c)),
+            0
+          );
+          const firstImported = imported[0];
+          const newDur = firstImported ? firstImported.durationSeconds : 5;
+
+          next.timeline.markers.push({
+            id: `marker_scene_${newSceneId}`,
+            time: Math.round(trackEnd * 100) / 100,
+            label: `Scene ${newSceneOrder}: ${newTitle}`,
+            kind: 'scene',
+            sceneId: newSceneId,
+            sceneOrder: newSceneOrder,
+            details: newTitle,
+          });
+
+          next.sequence.push({
+            id: newSceneId,
+            order: newSceneOrder,
+            title: newTitle,
+            targetDurationSeconds: newDur,
+            aspectRatio: next.format.aspectRatio,
+            resolution: `${next.format.width}x${next.format.height}`,
+            posterFrame:
+              firstImported && firstImported.kind === 'image' ? firstImported.relativePath : null,
+            selectedVideo:
+              firstImported && firstImported.kind === 'video' ? firstImported.relativePath : null,
+            alternateVideos: [],
+            dialogue: [],
+            soundEffects: [],
+            music: [],
+          });
+        }
+
+        // Scenario 1 (Section 8): If an imported OBS recording had chapter markers and the user opted to split into chapter sub-clips
+        if (vidTrack) {
+          let cursor = vidTrack.clips.reduce(
+            (max, c) => Math.max(max, c.timelineStart + getClipTimelineDuration(c)),
+            0
+          );
+          for (const asset of imported) {
+            if (asset.probedChapters && asset.probedChapters.length > 0) {
+              asset.probedChapters.forEach((ch, idx) => {
+                const dur = Math.max(0.2, ch.endTimeSeconds - ch.startTimeSeconds);
+                vidTrack.clips.push({
+                  id: `clip_${asset.id}_ch_${idx + 1}`,
+                  assetId: asset.id,
+                  trackId: vidTrack.id,
+                  sceneId: asset.sceneId,
+                  label: `${ch.title} (${asset.label})`,
+                  timelineStart: Math.round(cursor * 100) / 100,
+                  sourceIn: ch.startTimeSeconds,
+                  sourceOut: ch.endTimeSeconds,
+                  playbackRate: 1.0,
+                  muteSourceAudio: false,
+                  volume: 1.0,
+                  kenBurns: 'none',
+                });
+                placedChapterClipsCount++;
+                cursor = Math.round((cursor + dur) * 100) / 100;
+              });
+            }
+          }
+        }
+
+        // If assigned to a scene (or `autoPlace` is checked) and not already split by OBS chapters, place/attach onto the scene or playhead
+        if (placedChapterClipsCount === 0 && autoPlace) {
+          for (const asset of imported) {
+            const assignedScId = sceneTarget?.sceneId;
+            const assignedScOrd = sceneTarget?.sceneOrder;
+
+            if ((asset.kind === 'video' || asset.kind === 'image') && vidTrack) {
+              const existingSceneClip = assignedScId
+                ? vidTrack.clips.find((c) => c.sceneId === assignedScId)
+                : undefined;
+
+              if (existingSceneClip) {
+                // Attach to the scene's available takes and switch the scene's active visual to this newly imported asset!
+                const takes = new Set<string>(existingSceneClip.availableTakeAssetIds || []);
+                takes.add(existingSceneClip.assetId);
+                takes.add(asset.id);
+                existingSceneClip.availableTakeAssetIds = Array.from(takes);
+                existingSceneClip.assetId = asset.id;
+                existingSceneClip.label = asset.label;
+                existingSceneClip.sourceIn = 0;
+                existingSceneClip.sourceOut =
+                  asset.kind === 'image'
+                    ? Math.max(existingSceneClip.sourceOut - existingSceneClip.sourceIn, asset.durationSeconds)
+                    : asset.durationSeconds;
+                existingSceneClip.kenBurns = asset.kind === 'image' ? 'zoom-in' : 'none';
+              } else {
+                const startSec =
+                  sceneTarget?.mode === 'new-scene'
+                    ? vidTrack.clips.reduce(
+                        (max, c) => Math.max(max, c.timelineStart + getClipTimelineDuration(c)),
+                        0
+                      )
+                    : Math.round(playhead * 20) / 20;
+                vidTrack.clips.push({
+                  id: `clip_${asset.id}_${Date.now().toString().slice(-4)}`,
+                  assetId: asset.id,
+                  trackId: vidTrack.id,
+                  sceneId: assignedScId,
+                  sceneOrder: assignedScOrd,
+                  label: asset.label,
+                  timelineStart: Math.round(startSec * 100) / 100,
+                  sourceIn: 0,
+                  sourceOut: asset.durationSeconds,
+                  volume: 1.0,
+                  kenBurns: asset.kind === 'image' ? 'zoom-in' : 'none',
+                  availableTakeAssetIds: [asset.id],
+                });
+              }
+            } else if (asset.kind === 'dialogue' && dlgTrack) {
+              const sceneMarker = assignedScId
+                ? next.timeline.markers.find((m) => m.kind === 'scene' && m.sceneId === assignedScId)
+                : undefined;
+              const startSec = sceneMarker ? sceneMarker.time : Math.round(playhead * 20) / 20;
+              dlgTrack.clips.push({
+                id: `clip_${asset.id}_${Date.now().toString().slice(-4)}`,
+                assetId: asset.id,
+                trackId: dlgTrack.id,
+                sceneId: assignedScId,
+                sceneOrder: assignedScOrd,
+                label: asset.label,
+                timelineStart: Math.round(startSec * 100) / 100,
+                sourceIn: 0,
+                sourceOut: asset.durationSeconds,
+                volume: 1.0,
+              });
+            } else if (asset.kind === 'sfx' && sfxTrack) {
+              const sceneMarker = assignedScId
+                ? next.timeline.markers.find((m) => m.kind === 'scene' && m.sceneId === assignedScId)
+                : undefined;
+              const startSec = sceneMarker ? sceneMarker.time : Math.round(playhead * 20) / 20;
+              sfxTrack.clips.push({
+                id: `clip_${asset.id}_${Date.now().toString().slice(-4)}`,
+                assetId: asset.id,
+                trackId: sfxTrack.id,
+                sceneId: assignedScId,
+                sceneOrder: assignedScOrd,
+                label: asset.label,
+                timelineStart: Math.round(startSec * 100) / 100,
+                sourceIn: 0,
+                sourceOut: asset.durationSeconds,
+                volume: 0.9,
+              });
+            } else if (asset.kind === 'music' && musTrack) {
+              musTrack.clips.push({
+                id: `clip_${asset.id}_${Date.now().toString().slice(-4)}`,
+                assetId: asset.id,
+                trackId: musTrack.id,
+                label: asset.label,
+                timelineStart: Math.round(playhead * 20) / 20,
+                sourceIn: 0,
+                sourceOut: asset.durationSeconds,
+                volume: 0.35,
+                fadeIn: 0.5,
+                fadeOut: 1.0,
+              });
+            }
+          }
+        }
+
+        updatedSnapshot = next;
         return next;
       });
+
+      // Immediately persist `exports/video-project.json` + `exports/studio-updates.json` so Studio sees the new asset!
+      if (updatedSnapshot) {
+        await window.spliceWright.saveProject(projectRoot, updatedSnapshot);
+      }
+
       setLastImportedAssetId(imported[imported.length - 1].id);
       showToast(
-        `Imported ${imported.length} ${kind.toUpperCase()} file(s) — scrolled to "${
-          imported[imported.length - 1].label
-        }"`
+        placedChapterClipsCount > 0
+          ? `Imported ${imported.length} file(s) & placed ${placedChapterClipsCount} chapter sub-clips on timeline!`
+          : sceneTarget?.sceneId
+          ? `Imported ${imported.length} file(s) into ${
+              sceneTarget.sceneTitle || sceneTarget.sceneId
+            } & logged in exports/studio-updates.json!`
+          : `Imported ${imported.length} ${kind.toUpperCase()} file(s) — scrolled to "${
+              imported[imported.length - 1].label
+            }"`
       );
     } finally {
       setIsBusy(false);
     }
+  };
+
+  const handleImportMedia = async (kind: MediaAssetKind) => {
+    if (!projectRoot || !project) return;
+    // For Studio projects (or projects with scenes), ask which Scene this imported asset belongs to
+    // (Music defaults to Project-Wide Shared Asset, while Video/Img/Voiceover/SFX defaults to the Scene at Playhead)
+    if (aiMovieExists && kind !== 'music') {
+      const vidTrack = project.timeline.tracks.find((t) => t.type === 'video');
+      const clipAtPlayhead = vidTrack?.clips.find((c) => {
+        const dur = getClipTimelineDuration(c);
+        return playhead >= c.timelineStart && playhead < c.timelineStart + dur;
+      });
+      const defaultSceneId =
+        clipAtPlayhead?.sceneId || project.sequence[0]?.id || 'shared-project';
+      setImportSceneSelection(defaultSceneId);
+      setImportNewSceneTitle(`Scene ${project.sequence.length + 1}`);
+      setImportAutoPlaceOnTimeline(true);
+      setPendingImportKind(kind);
+      return;
+    }
+    await executeMediaImportWithTarget(
+      kind,
+      { mode: 'shared-project' },
+      false
+    );
   };
 
   const handleSyncAiMovie = async (mode: 'merge-new-assets' | 'reset-to-ai-movie') => {
@@ -523,6 +802,22 @@ export const App: React.FC = () => {
           ? 'Synced & rippled scenes with SpliceWright Studio (ai-movie.json)!'
           : 'Rebuilt timeline from SpliceWright Studio (custom BGM/SFX preserved).'
       );
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleRefreshSingleClip = async (clipId: string) => {
+    if (!projectRoot || !project) return;
+    setIsBusy(true);
+    try {
+      const res = await window.spliceWright.refreshSingleClipMedia(projectRoot, project, clipId);
+      updateProjectWithHistory(() => res.project);
+      showToast(
+        `Refreshed "${res.refreshedLabel}" (${res.newDurationSeconds.toFixed(1)}s) from disk / Studio without modifying other clips!`
+      );
+    } catch (err) {
+      showToast(`Refresh clip error: ${(err as Error).message}`);
     } finally {
       setIsBusy(false);
     }
@@ -784,262 +1079,335 @@ export const App: React.FC = () => {
       }}
     >
       {isAnyTaskRunning && <style>{`* { cursor: wait !important; }`}</style>}
-      {/* Top Application Header Bar */}
+      {/* Top Application Header Bar (2-Row Layout: Row 1 = Project Identity & Sync, Row 2 = Dedicated Action Ribbon) */}
       <header
         style={{
-          height: '52px',
           background: '#0b101d',
           borderBottom: '1px solid #1e293b',
           display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '0 16px',
+          flexDirection: 'column',
           flexShrink: 0,
         }}
       >
-        {/* Brand & Project Title */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              fontWeight: 700,
-              fontSize: '16px',
-              color: '#f8fafc',
-            }}
-          >
-            <Clapperboard size={20} color="#f59e0b" />
-            <span>SpliceWright</span>
-          </div>
-
-          {project && (
-            <>
-              <span style={{ color: '#334155' }}>|</span>
-              <span style={{ fontSize: '13px', fontWeight: 600, color: '#38bdf8' }}>
-                {project.title}
-              </span>
-              <span
-                style={{
-                  fontSize: '10px',
-                  padding: '2px 7px',
-                  borderRadius: '4px',
-                  background: aiMovieExists ? 'rgba(16, 185, 129, 0.15)' : 'rgba(56, 189, 248, 0.15)',
-                  border: aiMovieExists ? '1px solid #10b981' : '1px solid #38bdf8',
-                  color: aiMovieExists ? '#34d399' : '#38bdf8',
-                }}
-              >
-                {aiMovieExists ? 'SpliceWright Studio (ai-movie.json R/O)' : 'Standalone Folder Mode'}
-              </span>
-
-              {/* Aspect Ratio Selector (Never Locked to 9:16) */}
-              <select
-                value={project.format.aspectRatio}
-                onChange={(e) => handleChangeAspectRatio(e.target.value)}
-                title="Project Aspect Ratio & Output Resolution"
-                style={{
-                  background: '#161f33',
-                  color: '#e2e8f0',
-                  border: '1px solid #283552',
-                  borderRadius: '4px',
-                  padding: '3px 8px',
-                  fontSize: '11px',
-                }}
-              >
-                <option value="16:9">16:9 Widescreen (1920×1080)</option>
-                <option value="9:16">9:16 Vertical (1080×1920)</option>
-                <option value="1:1">1:1 Square (1080×1080)</option>
-                <option value="21:9">21:9 Cinema (2560×1080)</option>
-                <option value="4:3">4:3 Classic (1440×1080)</option>
-              </select>
-
-              {/* Topic 12: Non-Destructive Visual & Vintage Audio Look Preset Selector */}
-              <select
-                value={project.lookPreset || 'none'}
-                onChange={(e) =>
-                  updateProjectWithHistory((prev) => ({
-                    ...prev,
-                    lookPreset: e.target.value as VisualLookPreset,
-                  }))
-                }
-                title="Non-Destructive Visual Look & Vintage Audio Preset (applies uniformly across all scenes, posters, and exports)"
-                style={{
-                  background: '#161f33',
-                  color: project.lookPreset && project.lookPreset !== 'none' ? '#fbbf24' : '#cbd5e1',
-                  border:
-                    project.lookPreset && project.lookPreset !== 'none'
-                      ? '1px solid #f59e0b'
-                      : '1px solid #283552',
-                  borderRadius: '4px',
-                  padding: '3px 8px',
-                  fontSize: '11px',
-                }}
-              >
-                {(Object.keys(VISUAL_LOOK_PRESET_LABELS) as VisualLookPreset[]).map((key) => (
-                  <option key={key} value={key}>
-                    Look: {VISUAL_LOOK_PRESET_LABELS[key]}
-                  </option>
-                ))}
-              </select>
-            </>
-          )}
-        </div>
-
-        {/* Center Status / Sync Notification */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          {statusToast && (
+        {/* Row 1: Brand, Project Title, Format, Look Preset & Sync Studio Status */}
+        <div
+          style={{
+            minHeight: '42px',
+            padding: '5px 16px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '12px',
+            borderBottom: '1px solid #162035',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0, flexWrap: 'wrap' }}>
             <div
-              style={{
-                background: 'rgba(14, 116, 144, 0.25)',
-                border: '1px solid #06b6d4',
-                color: '#67e8f9',
-                padding: '4px 10px',
-                borderRadius: '5px',
-                fontSize: '11px',
-              }}
-            >
-              {statusToast}
-            </div>
-          )}
-
-          {aiMovieExists && (
-            <button
-              onClick={() => setShowSyncModal(true)}
-              style={{
-                ...headerBtnStyle,
-                background: syncSummary?.hasChanges ? '#065f46' : '#161f33',
-                borderColor: syncSummary?.hasChanges ? '#10b981' : '#f59e0b',
-                color: syncSummary?.hasChanges ? '#ecfdf5' : '#fbbf24',
-                fontWeight: syncSummary?.hasChanges ? 600 : 500,
-              }}
-              title="Sync changes or rebuild timeline from SpliceWright Studio (ai-movie.json)"
-            >
-              <RefreshCw size={13} />
-              <span>
-                {syncSummary?.hasChanges
-                  ? `Sync Studio (+${syncSummary.newTakesCount} takes, +${syncSummary.newDialogueCount} audio${
-                      syncSummary.newScenesCount
-                        ? `, +${syncSummary.newScenesCount} scenes`
-                        : ''
-                    }${
-                      syncSummary.durationChangesCount
-                        ? `, ${syncSummary.durationChangesCount} timing`
-                        : ''
-                    })`
-                  : 'Sync / Rebuild'}
-              </span>
-            </button>
-          )}
-        </div>
-
-        {/* Right Actions & Hardware Badge */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          {hardware && (
-            <div
-              title={`Adaptive Hardware Profile: ${hardware.cpuCores} cores, ${hardware.totalMemoryGb} GB RAM | Preferred Encoder: ${hardware.preferredEncoder} | Video Preload Pool: ${hardware.recommendedVideoPoolSize}`}
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                gap: '5px',
-                fontSize: '11px',
-                color: '#94a3b8',
-                background: '#131c2e',
-                padding: '4px 8px',
-                borderRadius: '4px',
-                border: '1px solid #1e293b',
+                gap: '8px',
+                fontWeight: 700,
+                fontSize: '15px',
+                color: '#f8fafc',
+                whiteSpace: 'nowrap',
               }}
             >
-              <Cpu size={13} color="#38bdf8" />
-              <span>{hardware.preferredEncoder}</span>
+              <Clapperboard size={19} color="#f59e0b" />
+              <span>SpliceWright</span>
             </div>
-          )}
 
-          <button onClick={handleOpenProjectFolder} style={headerBtnStyle}>
-            <FolderOpen size={14} color="#fbbf24" />
-            <span>Open Project</span>
-          </button>
+            {project && (
+              <>
+                <span style={{ color: '#334155' }}>|</span>
+                <span
+                  style={{
+                    fontSize: '13px',
+                    fontWeight: 600,
+                    color: '#38bdf8',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {project.title}
+                </span>
+                <span
+                  style={{
+                    fontSize: '10px',
+                    padding: '2px 7px',
+                    borderRadius: '4px',
+                    background: aiMovieExists
+                      ? 'rgba(16, 185, 129, 0.15)'
+                      : 'rgba(56, 189, 248, 0.15)',
+                    border: aiMovieExists ? '1px solid #10b981' : '1px solid #38bdf8',
+                    color: aiMovieExists ? '#34d399' : '#38bdf8',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {aiMovieExists
+                    ? 'SpliceWright Studio (ai-movie.json R/O)'
+                    : 'Standalone Folder Mode'}
+                </span>
 
-          <button
-            onClick={() => setShowNewStandaloneModal(true)}
-            style={headerBtnStyle}
-            title="Create or Open a Standalone Media Folder"
-          >
-            <FolderPlus size={14} color="#38bdf8" />
-            <span>Standalone Folder</span>
-          </button>
+                {/* Aspect Ratio Selector (Never Locked to 9:16) */}
+                <select
+                  value={project.format.aspectRatio}
+                  onChange={(e) => handleChangeAspectRatio(e.target.value)}
+                  title="Project Aspect Ratio & Output Resolution"
+                  style={{
+                    background: '#161f33',
+                    color: '#e2e8f0',
+                    border: '1px solid #283552',
+                    borderRadius: '4px',
+                    padding: '3px 8px',
+                    fontSize: '11px',
+                  }}
+                >
+                  <option value="16:9">16:9 Widescreen (1920×1080)</option>
+                  <option value="9:16">9:16 Vertical (1080×1920)</option>
+                  <option value="1:1">1:1 Square (1080×1080)</option>
+                  <option value="21:9">21:9 Cinema (2560×1080)</option>
+                  <option value="4:3">4:3 Classic (1440×1080)</option>
+                </select>
 
-          <button
-            onClick={() => {
-              setExportProgress(null);
-              setShowStitchModal(true);
-            }}
-            style={{
-              ...headerBtnStyle,
-              borderColor: '#a855f7',
-              color: '#e9d5ff',
-            }}
-            title="Stitch multiple exported Chapter / Reel MP4 videos (or scan a Production Catalogue folder) into a 20–60+ minute movie"
-          >
-            <Film size={14} color="#c084fc" />
-            <span>Stitch Chapters</span>
-          </button>
+                {/* Topic 12: Non-Destructive Visual & Vintage Audio Look Preset Selector */}
+                <select
+                  value={project.lookPreset || 'none'}
+                  onChange={(e) =>
+                    updateProjectWithHistory((prev) => ({
+                      ...prev,
+                      lookPreset: e.target.value as VisualLookPreset,
+                    }))
+                  }
+                  title="Non-Destructive Visual Look & Vintage Audio Preset (applies uniformly across all scenes, posters, and exports)"
+                  style={{
+                    background: '#161f33',
+                    color:
+                      project.lookPreset && project.lookPreset !== 'none' ? '#fbbf24' : '#cbd5e1',
+                    border:
+                      project.lookPreset && project.lookPreset !== 'none'
+                        ? '1px solid #f59e0b'
+                        : '1px solid #283552',
+                    borderRadius: '4px',
+                    padding: '3px 8px',
+                    fontSize: '11px',
+                  }}
+                >
+                  {(Object.keys(VISUAL_LOOK_PRESET_LABELS) as VisualLookPreset[]).map((key) => (
+                    <option key={key} value={key}>
+                      Look: {VISUAL_LOOK_PRESET_LABELS[key]}
+                    </option>
+                  ))}
+                </select>
+              </>
+            )}
+          </div>
 
-          <button
-            onClick={() => window.spliceWright.openExternalUrl(BUY_ME_A_COFFEE_URL)}
-            style={{
-              ...headerBtnStyle,
-              background: 'rgba(245, 158, 11, 0.14)',
-              borderColor: '#f59e0b',
-              color: '#fde68a',
-            }}
-            title="Support SpliceWright on Buy Me a Coffee (buymeacoffee.com/les.ey)"
-          >
-            <Coffee size={14} color="#fbbf24" />
-            <span>Buy Me a Coffee</span>
-          </button>
-
-          {project && (
-            <>
-              <button
-                onClick={async () => {
-                  const res = await window.spliceWright.toggleDualMonitorWindow();
-                  setIsDualMonitorOpen(res.isOpen);
-                }}
+          {/* Right side of Row 1: Status Toast & Sync Studio / Convert to Studio Project */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+            {statusToast && (
+              <div
                 style={{
-                  ...headerBtnStyle,
-                  background: isDualMonitorOpen ? '#065f46' : '#161f33',
-                  borderColor: isDualMonitorOpen ? '#10b981' : '#38bdf8',
-                  color: isDualMonitorOpen ? '#ecfdf5' : '#bae6fd',
+                  background: 'rgba(14, 116, 144, 0.25)',
+                  border: '1px solid #06b6d4',
+                  color: '#67e8f9',
+                  padding: '4px 10px',
+                  borderRadius: '5px',
+                  fontSize: '11px',
+                  maxWidth: '420px',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
                 }}
-                title="Pop out the Program Monitor onto a 2nd Screen and expand Timeline & Media Bin on Monitor 1"
+                title={statusToast}
               >
-                <Monitor size={14} color={isDualMonitorOpen ? '#34d399' : '#38bdf8'} />
-                <span>{isDualMonitorOpen ? '2nd Screen: ON' : '2nd Screen'}</span>
-              </button>
+                {statusToast}
+              </div>
+            )}
 
-              <button onClick={handleSaveProject} style={headerBtnStyle} title="Save video-project.json">
-                <Save size={14} color="#34d399" />
-                <span>Save</span>
-              </button>
-
+            {project && !aiMovieExists && (
               <button
-                onClick={() => {
-                  setExportProgress(null);
-                  setShowExportModal(true);
-                }}
+                onClick={handleConvertStandaloneToStudio}
+                disabled={isBusy}
                 style={{
                   ...headerBtnStyle,
-                  background: '#2563eb',
-                  borderColor: '#3b82f6',
-                  color: '#fff',
+                  background: 'rgba(16, 185, 129, 0.16)',
+                  borderColor: '#10b981',
+                  color: '#34d399',
                   fontWeight: 600,
                 }}
+                title="Convert this Standalone folder into a SpliceWright Studio project (creates ai-movie.json & extracts scene first-frame thumbnails)"
               >
-                <Download size={14} />
-                <span>Export MP4</span>
+                <Wand2 size={13} color="#34d399" />
+                <span>Convert to Studio Project</span>
               </button>
-            </>
-          )}
+            )}
+
+            {aiMovieExists && (
+              <button
+                onClick={() => setShowSyncModal(true)}
+                style={{
+                  ...headerBtnStyle,
+                  background: syncSummary?.hasChanges ? '#065f46' : '#161f33',
+                  borderColor: syncSummary?.hasChanges ? '#10b981' : '#f59e0b',
+                  color: syncSummary?.hasChanges ? '#ecfdf5' : '#fbbf24',
+                  fontWeight: syncSummary?.hasChanges ? 600 : 500,
+                }}
+                title="Sync changes or rebuild timeline from SpliceWright Studio (ai-movie.json)"
+              >
+                <RefreshCw size={13} />
+                <span>
+                  {syncSummary?.hasChanges
+                    ? `Sync Studio (+${syncSummary.newTakesCount} takes, +${syncSummary.newDialogueCount} audio${
+                        syncSummary.modifiedMediaCount
+                          ? `, ${syncSummary.modifiedMediaCount} updated`
+                          : ''
+                      }${
+                        syncSummary.newScenesCount
+                          ? `, +${syncSummary.newScenesCount} scenes`
+                          : ''
+                      }${
+                        syncSummary.durationChangesCount
+                          ? `, ${syncSummary.durationChangesCount} timing`
+                          : ''
+                      }${
+                        syncSummary.newTextOverlaysCount
+                          ? `, +${syncSummary.newTextOverlaysCount} text`
+                          : ''
+                      })`
+                    : 'Sync / Rebuild'}
+                </span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Row 2: Dedicated Action Ribbon (All Action Buttons after Sync Studio, Always Visible even on Non-Maximized Windows) */}
+        <div
+          style={{
+            minHeight: '40px',
+            padding: '5px 16px',
+            background: '#080c17',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '8px',
+            flexWrap: 'wrap',
+          }}
+        >
+          {/* Left Ribbon Group: Project & Workflow Tools */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <button onClick={handleOpenProjectFolder} style={headerBtnStyle}>
+              <FolderOpen size={14} color="#fbbf24" />
+              <span>Open Project</span>
+            </button>
+
+            <button
+              onClick={() => setShowNewStandaloneModal(true)}
+              style={headerBtnStyle}
+              title="Create or Open a Standalone Media Folder"
+            >
+              <FolderPlus size={14} color="#38bdf8" />
+              <span>Standalone Folder</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setExportProgress(null);
+                setShowStitchModal(true);
+              }}
+              style={{
+                ...headerBtnStyle,
+                borderColor: '#a855f7',
+                color: '#e9d5ff',
+              }}
+              title="Stitch multiple exported Chapter / Reel MP4 videos (or scan a Production Catalogue folder) into a 20–60+ minute movie"
+            >
+              <Film size={14} color="#c084fc" />
+              <span>Stitch Chapters</span>
+            </button>
+
+            {hardware && (
+              <div
+                title={`Adaptive Hardware Profile: ${hardware.cpuCores} cores, ${hardware.totalMemoryGb} GB RAM | Preferred Encoder: ${hardware.preferredEncoder} | Video Preload Pool: ${hardware.recommendedVideoPoolSize}`}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                  fontSize: '11px',
+                  color: '#94a3b8',
+                  background: '#131c2e',
+                  padding: '4px 8px',
+                  borderRadius: '4px',
+                  border: '1px solid #1e293b',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                <Cpu size={13} color="#38bdf8" />
+                <span>{hardware.preferredEncoder}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Right Ribbon Group: 2nd Screen, Buy Me a Coffee, Save & Export MP4 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <button
+              onClick={() => window.spliceWright.openExternalUrl(BUY_ME_A_COFFEE_URL)}
+              style={{
+                ...headerBtnStyle,
+                background: 'rgba(245, 158, 11, 0.14)',
+                border: '1px solid #f59e0b',
+                color: '#fde68a',
+                fontWeight: 600,
+              }}
+              title="Support SpliceWright on Buy Me a Coffee (buymeacoffee.com/les.ey)"
+            >
+              <Coffee size={14} color="#fbbf24" />
+              <span>Buy Me a Coffee</span>
+            </button>
+
+            {project && (
+              <>
+                <button
+                  onClick={async () => {
+                    const res = await window.spliceWright.toggleDualMonitorWindow();
+                    setIsDualMonitorOpen(res.isOpen);
+                  }}
+                  style={{
+                    ...headerBtnStyle,
+                    background: isDualMonitorOpen ? '#065f46' : '#161f33',
+                    borderColor: isDualMonitorOpen ? '#10b981' : '#38bdf8',
+                    color: isDualMonitorOpen ? '#ecfdf5' : '#bae6fd',
+                  }}
+                  title="Pop out the Program Monitor onto a 2nd Screen and expand Timeline & Media Bin on Monitor 1"
+                >
+                  <Monitor size={14} color={isDualMonitorOpen ? '#34d399' : '#38bdf8'} />
+                  <span>{isDualMonitorOpen ? '2nd Screen: ON' : '2nd Screen'}</span>
+                </button>
+
+                <button onClick={handleSaveProject} style={headerBtnStyle} title="Save video-project.json & studio-updates.json">
+                  <Save size={14} color="#34d399" />
+                  <span>Save</span>
+                </button>
+
+                <button
+                  onClick={() => {
+                    setExportProgress(null);
+                    setShowExportModal(true);
+                  }}
+                  style={{
+                    ...headerBtnStyle,
+                    background: '#2563eb',
+                    borderColor: '#3b82f6',
+                    color: '#fff',
+                    fontWeight: 600,
+                  }}
+                >
+                  <Download size={14} />
+                  <span>Export MP4</span>
+                </button>
+              </>
+            )}
+          </div>
         </div>
       </header>
 
@@ -1104,12 +1472,41 @@ export const App: React.FC = () => {
               </button>
             </div>
 
+            {isStudioAutoLaunching && studioLaunchPath && (
+              <div
+                style={{
+                  marginTop: '16px',
+                  padding: '12px 16px',
+                  background: 'rgba(16, 185, 129, 0.14)',
+                  border: '1px solid #10b981',
+                  borderRadius: '8px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '10px',
+                  color: '#ecfdf5',
+                  fontSize: '13px',
+                }}
+              >
+                <RefreshCw size={16} color="#34d399" />
+                <div>
+                  <strong>Launching Project from SpliceWright Studio...</strong>
+                  <div style={{ fontSize: '11px', color: '#a7f3d0', marginTop: '2px' }}>
+                    Loading scenes, media assets, and timeline from <code>{studioLaunchPath}</code>. Start screen options are disabled while loading.
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div
               style={{
                 display: 'grid',
                 gridTemplateColumns: '1fr 1fr 1fr',
                 gap: '14px',
                 marginTop: '24px',
+                opacity: isStudioAutoLaunching || isBusy ? 0.42 : 1,
+                pointerEvents: isStudioAutoLaunching || isBusy ? 'none' : 'auto',
+                filter: isStudioAutoLaunching || isBusy ? 'grayscale(0.55)' : 'none',
+                transition: 'opacity 0.2s ease',
               }}
             >
               {/* Card 1: Open SpliceWright Studio Project */}
@@ -1124,6 +1521,7 @@ export const App: React.FC = () => {
                 </p>
                 <button
                   onClick={handleOpenProjectFolder}
+                  disabled={isStudioAutoLaunching || isBusy}
                   style={{ ...primaryActionBtnStyle, marginTop: '14px', background: '#d97706' }}
                 >
                   Select Studio Folder
@@ -1142,6 +1540,7 @@ export const App: React.FC = () => {
                 </p>
                 <button
                   onClick={() => setShowNewStandaloneModal(true)}
+                  disabled={isStudioAutoLaunching || isBusy}
                   style={{ ...primaryActionBtnStyle, marginTop: '14px', background: '#0284c7' }}
                 >
                   Start Standalone Folder
@@ -1160,6 +1559,7 @@ export const App: React.FC = () => {
                 </p>
                 <button
                   onClick={handleLoadSampleProject}
+                  disabled={isStudioAutoLaunching || isBusy}
                   style={{ ...primaryActionBtnStyle, marginTop: '14px', background: '#7e22ce' }}
                 >
                   Load Sample Project
@@ -1212,6 +1612,10 @@ export const App: React.FC = () => {
                   projectRoot={projectRoot}
                   project={project}
                   playhead={playhead}
+                  selectedClipId={selectedClipId}
+                  onSelectClip={setSelectedClipId}
+                  onUpdateProject={updateProjectWithHistory}
+                  onCommitUndoSnapshot={commitUndoSnapshot}
                   isPlaying={isPlaying}
                   recommendedPoolSize={hardware?.recommendedVideoPoolSize || 2}
                   onPlayheadChange={(t) => setPlayhead(t)}
@@ -1228,6 +1632,7 @@ export const App: React.FC = () => {
                 isExpandedWidth={isDualMonitorOpen}
                 onImportMedia={handleImportMedia}
                 onUpdateProject={updateProjectWithHistory}
+                onRefreshSingleClip={handleRefreshSingleClip}
               />
             </div>
           </div>
@@ -1250,7 +1655,142 @@ export const App: React.FC = () => {
               onCommitUndoSnapshot={commitUndoSnapshot}
               onNormalizeDialogue={handleNormalizeDialogue}
               onPreMixAudio={handlePreMixAudio}
+              onPausePlayback={() => setIsPlaying(false)}
             />
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Assign Imported Media to Scene (Editor -> Studio Outbox `exports/studio-updates.json`) */}
+      {pendingImportKind && project && projectRoot && (
+        <div style={modalBackdropStyle}>
+          <div style={{ ...modalBoxStyle, width: '500px' }}>
+            <h2 style={{ fontSize: '16px', fontWeight: 700, marginBottom: '8px', color: '#f8fafc' }}>
+              Assign Imported {pendingImportKind.toUpperCase()} to Scene
+            </h2>
+            <p style={{ fontSize: '12px', color: '#94a3b8', marginBottom: '14px', lineHeight: 1.45 }}>
+              Select which scene this file belongs to so <strong>SpliceWright</strong> can store it
+              in the right folder and notify <strong>SpliceWright Studio</strong> via{' '}
+              <code>exports/studio-updates.json</code>.
+            </p>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '12px' }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <span style={{ fontWeight: 600, color: '#cbd5e1' }}>Target Scene Assignment</span>
+                <select
+                  value={importSceneSelection}
+                  onChange={(e) => setImportSceneSelection(e.target.value)}
+                  style={modalInputStyle}
+                >
+                  {project.sequence.map((seq) => (
+                    <option key={seq.id} value={seq.id}>
+                      Scene {seq.order}: {seq.title} ({seq.id})
+                    </option>
+                  ))}
+                  <option value="new-scene">➕ Create a New Scene for this Asset</option>
+                  <option value="shared-project">
+                    🌐 Project-Wide / Shared Asset (assets/ — No Specific Scene)
+                  </option>
+                </select>
+              </label>
+
+              {importSceneSelection === 'new-scene' && (
+                <label style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <span style={{ fontWeight: 600, color: '#34d399' }}>New Scene Title</span>
+                  <input
+                    type="text"
+                    value={importNewSceneTitle}
+                    onChange={(e) => setImportNewSceneTitle(e.target.value)}
+                    placeholder="Enter scene title..."
+                    style={modalInputStyle}
+                  />
+                </label>
+              )}
+
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  marginTop: '4px',
+                  cursor: 'pointer',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={importAutoPlaceOnTimeline}
+                  onChange={(e) => setImportAutoPlaceOnTimeline(e.target.checked)}
+                />
+                <span>
+                  {importSceneSelection === 'shared-project'
+                    ? 'Also place clip onto timeline at current Playhead position'
+                    : importSceneSelection === 'new-scene'
+                    ? 'Place new scene at the end of the timeline'
+                    : 'Set as active clip on the selected scene (and add to scene Take Switcher)'}
+                </span>
+              </label>
+            </div>
+
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'flex-end',
+                gap: '8px',
+                marginTop: '18px',
+              }}
+            >
+              <button onClick={() => setPendingImportKind(null)} style={headerBtnStyle}>
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  const kindToRun = pendingImportKind;
+                  setPendingImportKind(null);
+                  if (!kindToRun) return;
+
+                  let target: ImportMediaSceneTarget;
+                  if (importSceneSelection === 'shared-project') {
+                    target = { mode: 'shared-project' };
+                  } else if (importSceneSelection === 'new-scene') {
+                    const maxNum = project.sequence.reduce((max, s) => {
+                      const m = s.id.match(/^scene-(\d+)$/i);
+                      return m ? Math.max(max, parseInt(m[1], 10)) : max;
+                    }, project.sequence.length);
+                    const nextSceneId = `scene-${maxNum + 1}`;
+                    const nextOrder = project.sequence.length + 1;
+                    target = {
+                      mode: 'new-scene',
+                      sceneId: nextSceneId,
+                      sceneOrder: nextOrder,
+                      sceneTitle: importNewSceneTitle.trim() || `Scene ${nextOrder}`,
+                    };
+                  } else {
+                    const seq = project.sequence.find((s) => s.id === importSceneSelection);
+                    target = {
+                      mode: 'assigned-scene',
+                      sceneId: importSceneSelection,
+                      sceneOrder: seq?.order,
+                      sceneTitle: seq?.title || importSceneSelection,
+                    };
+                  }
+
+                  await executeMediaImportWithTarget(
+                    kindToRun,
+                    target,
+                    importAutoPlaceOnTimeline
+                  );
+                }}
+                style={{
+                  ...headerBtnStyle,
+                  background: '#059669',
+                  borderColor: '#10b981',
+                  color: '#fff',
+                  fontWeight: 600,
+                }}
+              >
+                Choose File(s)...
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1578,8 +2118,12 @@ export const App: React.FC = () => {
                 <ul style={{ margin: 0, paddingLeft: '18px', color: '#94a3b8' }}>
                   <li>New video / poster takes: <strong style={{ color: '#f8fafc' }}>{syncSummary.newTakesCount}</strong></li>
                   <li>New dialogue / voiceover clips: <strong style={{ color: '#f8fafc' }}>{syncSummary.newDialogueCount}</strong></li>
+                  <li>Modified audio / image / video files in-place: <strong style={{ color: '#f8fafc' }}>{syncSummary.modifiedMediaCount || 0}</strong></li>
                   <li>Scene duration / slate updates: <strong style={{ color: '#f8fafc' }}>{syncSummary.durationChangesCount || 0}</strong></li>
                   <li>New scenes added: <strong style={{ color: '#f8fafc' }}>{syncSummary.newScenesCount}</strong></li>
+                  {!!syncSummary.newTextOverlaysCount && (
+                    <li>New scene text overlays: <strong style={{ color: '#f8fafc' }}>{syncSummary.newTextOverlaysCount}</strong></li>
+                  )}
                 </ul>
               </div>
             )}
@@ -2016,8 +2560,24 @@ const headerBtnStyle: React.CSSProperties = {
   color: '#e2e8f0',
   border: '1px solid #283552',
   borderRadius: '5px',
-  padding: '6px 11px',
+  padding: '5px 10px',
   fontSize: '12px',
+  whiteSpace: 'nowrap',
+  flexShrink: 0,
+  boxSizing: 'border-box',
+};
+
+const dropdownItemBtnStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: '10px',
+  width: '100%',
+  background: 'transparent',
+  border: '1px solid transparent',
+  borderRadius: '6px',
+  padding: '7px 10px',
+  fontSize: '12px',
+  cursor: 'pointer',
 };
 
 const welcomeCardStyle: React.CSSProperties = {
